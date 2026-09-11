@@ -1,0 +1,65 @@
+[project]
+name = "baseten-bdn"
+version = "0.0.1"
+description = "Python SDK for working with BDN inside and outside Baseten"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "poethepoet>=0.35",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.16",
+    "ty>=0.0.43",
+]
+
+[project.urls]
+Homepage = "https://github.com/basetenlabs/baseten-bdn"
+Issues = "https://github.com/basetenlabs/baseten-bdn/issues"
+
+[tool.poe.tasks]
+typecheck = "ty check"
+test = "pytest"
+
+[tool.poe.tasks.format]
+sequence = [
+    { cmd = "ruff format ." },
+    { cmd = "ruff check --fix --exit-zero ." },
+]
+
+[tool.poe.tasks.lint]
+sequence = [
+    { cmd = "ruff format --check ." },
+    { cmd = "ruff check ." },
+]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# baseten is a PEP 420 namespace package shared across baseten-* distributions
+# (baseten-python provides baseten.client, baseten-loops provides
+# baseten.loops). There is intentionally no baseten/__init__.py; this names the
+# namespace dir for hatchling to package.
+[tool.hatch.build.targets.wheel]
+packages = ["baseten"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
