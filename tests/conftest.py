@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from baseten.bdn import _http
+from baseten.bdn.hotload._client import SOCKET_BASE_URL
 
 
 @dataclass
@@ -58,7 +58,7 @@ class FakeTransport:
 
     def sync_client(self) -> httpx.Client:
         return httpx.Client(
-            transport=httpx.MockTransport(self._handle), base_url=_http.SOCKET_BASE_URL
+            transport=httpx.MockTransport(self._handle), base_url=SOCKET_BASE_URL
         )
 
     def async_client(self) -> httpx.AsyncClient:
@@ -66,5 +66,5 @@ class FakeTransport:
             return self._handle(request)
 
         return httpx.AsyncClient(
-            transport=httpx.MockTransport(handle), base_url=_http.SOCKET_BASE_URL
+            transport=httpx.MockTransport(handle), base_url=SOCKET_BASE_URL
         )

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class AttachmentState(str, Enum):
+class AttachmentState(StrEnum):
     """Whether the node bound the volume view below ``/bdn/mounts``.
 
     The daemon journals an attachment as ``FAILED`` until the bind succeeds and
@@ -54,6 +54,18 @@ class VolumeAttachment(BaseModel):
     exclude: tuple[str, ...] = ()
 
 
+class ErrorBody(BaseModel):
+    """The error body the daemon returns on a non-2xx status.
+
+    Unknown fields are ignored so an additive daemon field can never turn a
+    retryable error into a protocol error.
+    """
+
+    code: str
+    message: str
+    retryable: bool
+
+
 class HotLoadError(Exception):
     """Base class for every error raised by the Hot Load client."""
 
@@ -72,7 +84,7 @@ class HotLoadTimeoutError(HotLoadError):
 
     For an attach this does not mean the attach failed: the daemon may have
     finished it, or abandoned it and left a ``FAILED`` attachment holding the
-    target name. Inspect ``list_volumes`` and detach any leftover before
+    target name. Inspect ``list_attachments`` and detach any leftover before
     retrying.
     """
 
@@ -105,7 +117,7 @@ class HotLoadAttachError(HotLoadError):
     """The daemon answered the attach with a ``FAILED`` attachment.
 
     The attachment still holds its target name. Detach it by id, then attach
-    again with a fresh idempotency key.
+    again.
     """
 
     def __init__(self, attachment: VolumeAttachment) -> None:

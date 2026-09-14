@@ -94,7 +94,7 @@ def test_attach_posts_the_request_and_returns_the_ready_attachment() -> None:
     assert len(request.headers["idempotency-key"]) == 32
 
 
-def test_attach_sends_filters_and_a_caller_supplied_key() -> None:
+def test_attach_sends_filters() -> None:
     fake = FakeTransport([Reply(202, FILTERED_ATTACHMENT)])
 
     attachment = sync_client(fake).attach(
@@ -102,7 +102,6 @@ def test_attach_sends_filters_and_a_caller_supplied_key() -> None:
         target="probe",
         include=["*.json"],
         exclude=["config.json"],
-        idempotency_key="startup-probe",
     )
 
     assert attachment.include == ("*.json",)
@@ -114,16 +113,7 @@ def test_attach_sends_filters_and_a_caller_supplied_key() -> None:
         "include": ["*.json"],
         "exclude": ["config.json"],
     }
-    assert request.headers["idempotency-key"] == "startup-probe"
-
-
-@pytest.mark.parametrize("key", ["", "clé", "x" * 257, "tab\there"])
-def test_attach_rejects_keys_the_daemon_would_refuse(key: str) -> None:
-    fake = FakeTransport([Reply(202, READY_ATTACHMENT)])
-
-    with pytest.raises(ValueError, match="idempotency_key"):
-        sync_client(fake).attach(SOURCE, target="probe", idempotency_key=key)
-    assert fake.requests == []
+    assert len(request.headers["idempotency-key"]) == 32
 
 
 def test_attach_raises_when_the_attachment_is_failed() -> None:
@@ -183,7 +173,9 @@ def test_attach_does_not_retry_after_a_dropped_connection() -> None:
         [Reply(error=httpx.RemoteProtocolError("server disconnected"))]
     )
 
-    with pytest.raises(HotLoadConnectionError, match="Inspect list_volumes") as raised:
+    with pytest.raises(
+        HotLoadConnectionError, match="Inspect list_attachments"
+    ) as raised:
         sync_client(fake).attach(SOURCE, target="probe")
 
     assert not isinstance(raised.value, HotLoadTimeoutError)
@@ -218,7 +210,7 @@ def test_get_retries_after_a_dropped_response_but_delete_does_not() -> None:
     dropped = Reply(error=httpx.ReadError("connection reset"))
 
     listing = FakeTransport([dropped, Reply(200, {"volumes": []})])
-    assert sync_client(listing).list_volumes() == []
+    assert sync_client(listing).list_attachments() == []
     assert len(listing.requests) == 2
 
     deleting = FakeTransport([dropped])
@@ -231,16 +223,16 @@ def test_non_transport_httpx_errors_are_protocol_errors() -> None:
     fake = FakeTransport([Reply(error=httpx.DecodingError("bad content-encoding"))])
 
     with pytest.raises(HotLoadProtocolError, match="unusable response"):
-        sync_client(fake).list_volumes()
+        sync_client(fake).list_attachments()
     assert len(fake.requests) == 1
 
 
-def test_list_volumes_parses_the_volumes_array() -> None:
+def test_list_attachments_parses_the_volumes_array() -> None:
     fake = FakeTransport(
         [Reply(200, {"volumes": [READY_ATTACHMENT, FAILED_ATTACHMENT]})]
     )
 
-    volumes = sync_client(fake).list_volumes()
+    volumes = sync_client(fake).list_attachments()
 
     assert [volume.state for volume in volumes] == [
         AttachmentState.READY,
@@ -250,17 +242,17 @@ def test_list_volumes_parses_the_volumes_array() -> None:
     assert fake.requests[0].path == "/v1/hotload/volumes"
 
 
-def test_list_volumes_requires_the_volumes_key() -> None:
+def test_list_attachments_requires_the_volumes_key() -> None:
     fake = FakeTransport([Reply(200, {"mounts": [READY_ATTACHMENT]})])
 
     with pytest.raises(HotLoadProtocolError, match="volumes"):
-        sync_client(fake).list_volumes()
+        sync_client(fake).list_attachments()
 
 
-def test_get_volume_addresses_the_attachment_and_returns_failed_as_data() -> None:
+def test_get_attachment_addresses_the_attachment_and_returns_failed_as_data() -> None:
     fake = FakeTransport([Reply(200, FAILED_ATTACHMENT)])
 
-    attachment = sync_client(fake).get_volume(ATTACHMENT_ID)
+    attachment = sync_client(fake).get_attachment(ATTACHMENT_ID)
 
     assert attachment.state is AttachmentState.FAILED
     assert fake.requests[0].path == f"/v1/hotload/volumes/{ATTACHMENT_ID}"
@@ -271,7 +263,7 @@ def test_unknown_attachment_fields_are_ignored() -> None:
     # so an additive daemon field must not break existing callers.
     fake = FakeTransport([Reply(200, {**READY_ATTACHMENT, "view_id": "abc"})])
 
-    assert sync_client(fake).get_volume(ATTACHMENT_ID).id == ATTACHMENT_ID
+    assert sync_client(fake).get_attachment(ATTACHMENT_ID).id == ATTACHMENT_ID
 
 
 @pytest.mark.parametrize(
@@ -299,7 +291,7 @@ def test_attachments_off_contract_are_protocol_errors(payload: Any) -> None:
     fake = FakeTransport([Reply(200, payload)])
 
     with pytest.raises(HotLoadProtocolError, match="VolumeAttachment"):
-        sync_client(fake).get_volume(ATTACHMENT_ID)
+        sync_client(fake).get_attachment(ATTACHMENT_ID)
 
 
 def test_detach_returns_none_on_204() -> None:
@@ -337,7 +329,7 @@ def test_error_bodies_off_contract_are_protocol_errors() -> None:
     fake = FakeTransport([Reply(502, {"error": "bad gateway"})])
 
     with pytest.raises(HotLoadProtocolError, match="HTTP 502"):
-        sync_client(fake).list_volumes()
+        sync_client(fake).list_attachments()
 
 
 def test_error_bodies_with_extra_fields_keep_their_retry_hint() -> None:
@@ -348,7 +340,7 @@ def test_error_bodies_with_extra_fields_keep_their_retry_hint() -> None:
         ]
     )
 
-    assert sync_client(fake).list_volumes() == []
+    assert sync_client(fake).list_attachments() == []
     assert len(fake.requests) == 2
 
 
@@ -401,7 +393,7 @@ def test_reads_use_a_short_timeout_and_mutations_the_request_timeout() -> None:
     )
     client = HotLoadClient(http_client_override=http_client, request_timeout_sec=900)
 
-    client.list_volumes()
+    client.list_attachments()
     client.healthy()
     with pytest.raises(HotLoadProtocolError):
         client.attach(SOURCE, target="probe")
@@ -446,12 +438,12 @@ async def test_async_attach_and_detach() -> None:
     fake = FakeTransport([Reply(202, READY_ATTACHMENT), Reply(204)])
 
     async with async_client(fake) as client:
-        attachment = await client.attach(SOURCE, target="probe", idempotency_key="k")
+        attachment = await client.attach(SOURCE, target="probe")
         await client.detach(attachment.id)
 
     assert attachment.pinned_source == PINNED
     assert [request.method for request in fake.requests] == ["POST", "DELETE"]
-    assert fake.requests[0].headers["idempotency-key"] == "k"
+    assert len(fake.requests[0].headers["idempotency-key"]) == 32
 
 
 async def test_async_attach_retries_retryable_errors_with_the_same_key() -> None:
@@ -476,7 +468,7 @@ async def test_async_list_and_health() -> None:
     fake = FakeTransport([Reply(200, {"volumes": [READY_ATTACHMENT]}), UNAVAILABLE])
     client = async_client(fake)
 
-    assert [volume.id for volume in await client.list_volumes()] == [ATTACHMENT_ID]
+    assert [volume.id for volume in await client.list_attachments()] == [ATTACHMENT_ID]
     assert await client.healthy() is False
     assert len(fake.requests) == 2
     await client.close()

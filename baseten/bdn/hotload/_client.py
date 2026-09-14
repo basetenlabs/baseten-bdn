@@ -21,21 +21,22 @@ Wire contract (HTTP+JSON over the socket):
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
-import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from baseten.bdn import _http
 from baseten.bdn.hotload._models import (
     AttachmentState,
+    ErrorBody,
     HotLoadAPIError,
     HotLoadAttachError,
     HotLoadConnectionError,
@@ -45,29 +46,30 @@ from baseten.bdn.hotload._models import (
     VolumeAttachment,
 )
 
-if sys.version_info >= (3, 11):
-    from typing import Self
-else:
-    from typing_extensions import Self
-
 DEFAULT_SOCKET_PATH = Path("/bdn/hotload.sock")
-MOUNT_ROOT = Path("/bdn/mounts")
 DEFAULT_REQUEST_TIMEOUT_SEC = 600.0
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_INTERVAL_SEC = 0.1
 
+# httpx requires an absolute URL even when the transport is a Unix socket; the
+# host is never resolved, so any stable placeholder works.
+SOCKET_BASE_URL = "http://bdn.local"
+# A local socket connects at once or not at all. Without this bound the async
+# transport spins on a full listen backlog until the read timeout expires.
+_CONNECT_TIMEOUT_SEC = 5.0
+# Reads are in-memory lookups on the daemon; only attach and detach touch mounts.
+_LOOKUP_TIMEOUT_SEC = 10.0
+
 _VOLUMES_PATH = "/v1/hotload/volumes"
 _HEALTH_PATH = "/healthz"
 _IDEMPOTENCY_HEADER = "Idempotency-Key"
-_MAX_IDEMPOTENCY_KEY_BYTES = 256
-# Reads are in-memory lookups on the daemon; only attach and detach touch mounts.
-_LOOKUP_TIMEOUT_SEC = 10.0
 # Daemon ids are `vol_` followed by a ULID; anything else never names an
 # attachment, and `.`/`?`/`#` would be reinterpreted by URL parsing.
 _ATTACHMENT_ID = re.compile(r"[A-Za-z0-9_-]+")
 _INTERRUPTED_HINT = (
     " The daemon may have finished or abandoned it; an abandoned attach stays listed"
-    " as FAILED and holds its target until detached. Inspect list_volumes before retrying."
+    " as FAILED and holds its target until detached. Inspect list_attachments before"
+    " retrying."
 )
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -140,7 +142,7 @@ class HotLoadClient:
             retry_interval_sec=retry_interval_sec,
         )
         self._http_client = (
-            _http.unix_socket_client(
+            _unix_socket_client(
                 self._options.socket_path, timeout_sec=request_timeout_sec
             )
             if http_client_override is None
@@ -154,10 +156,12 @@ class HotLoadClient:
 
     @property
     def options(self) -> HotLoadClientOptions:
+        """The options this client was constructed with."""
         return self._options
 
     @property
     def http_client(self) -> httpx.Client:
+        """The underlying httpx client."""
         return self._http_client
 
     def attach(
@@ -167,9 +171,11 @@ class HotLoadClient:
         target: str,
         include: Sequence[str] = (),
         exclude: Sequence[str] = (),
-        idempotency_key: str | None = None,
     ) -> VolumeAttachment:
         """Attach ``source`` at ``/bdn/mounts/<target>`` and return it once readable.
+
+        Each call mints one idempotency key and reuses it across its own
+        retries, so a retried request cannot attach the same volume twice.
 
         Args:
             source: A BDN volume ref, ``bdn:<namespace>/<volume>`` optionally
@@ -180,10 +186,6 @@ class HotLoadClient:
                 Each name can hold one attachment at a time.
             include: Glob filters selecting the files to materialize.
             exclude: Glob filters removing files from the selection.
-            idempotency_key: 1 to 256 printable ASCII characters. Defaults to
-                a fresh key that is reused across this call's own retries, so
-                a retried request cannot attach twice. Pass a stable key to
-                make the call safe to repeat from the caller's side as well.
 
         Raises:
             HotLoadAttachError: The daemon answered with a ``FAILED``
@@ -191,22 +193,23 @@ class HotLoadClient:
             HotLoadAPIError: The daemon rejected the request.
             HotLoadTimeoutError: No answer within the request timeout. The
                 attach may have completed or been abandoned on the node;
-                check ``list_volumes``.
+                check :meth:`list_attachments`.
         """
         body = self._request(
             "POST",
             _VOLUMES_PATH,
             json=_attach_request(source, target, include, exclude),
-            headers={_IDEMPOTENCY_HEADER: _idempotency_key(idempotency_key)},
+            headers={_IDEMPOTENCY_HEADER: uuid.uuid4().hex},
         )
         return _ready_attachment(_parse(VolumeAttachment, body))
 
-    def list_volumes(self) -> list[VolumeAttachment]:
+    def list_attachments(self) -> list[VolumeAttachment]:
         """List this pod's attachments, including ``FAILED`` ones."""
         body = self._request("GET", _VOLUMES_PATH, timeout_sec=_LOOKUP_TIMEOUT_SEC)
-        return _parse(_VolumeList, body).volumes
+        return _parse(_AttachmentList, body).volumes
 
-    def get_volume(self, attachment_id: str) -> VolumeAttachment:
+    def get_attachment(self, attachment_id: str) -> VolumeAttachment:
+        """Return one attachment by id, whatever its state."""
         body = self._request(
             "GET", _volume_path(attachment_id), timeout_sec=_LOOKUP_TIMEOUT_SEC
         )
@@ -231,6 +234,7 @@ class HotLoadClient:
         return True
 
     def close(self) -> None:
+        """Close the HTTP client if this object owns it. Attachments are unaffected."""
         if self.close_http_client_on_close:
             self._http_client.close()
 
@@ -294,7 +298,7 @@ class AsyncHotLoadClient:
             retry_interval_sec=retry_interval_sec,
         )
         self._http_client = (
-            _http.unix_socket_async_client(
+            _unix_socket_async_client(
                 self._options.socket_path, timeout_sec=request_timeout_sec
             )
             if http_client_override is None
@@ -308,10 +312,12 @@ class AsyncHotLoadClient:
 
     @property
     def options(self) -> HotLoadClientOptions:
+        """The options this client was constructed with."""
         return self._options
 
     @property
     def http_client(self) -> httpx.AsyncClient:
+        """The underlying httpx client."""
         return self._http_client
 
     async def attach(
@@ -321,33 +327,36 @@ class AsyncHotLoadClient:
         target: str,
         include: Sequence[str] = (),
         exclude: Sequence[str] = (),
-        idempotency_key: str | None = None,
     ) -> VolumeAttachment:
         """Attach ``source`` at ``/bdn/mounts/<target>``. See :meth:`HotLoadClient.attach`."""
         body = await self._request(
             "POST",
             _VOLUMES_PATH,
             json=_attach_request(source, target, include, exclude),
-            headers={_IDEMPOTENCY_HEADER: _idempotency_key(idempotency_key)},
+            headers={_IDEMPOTENCY_HEADER: uuid.uuid4().hex},
         )
         return _ready_attachment(_parse(VolumeAttachment, body))
 
-    async def list_volumes(self) -> list[VolumeAttachment]:
+    async def list_attachments(self) -> list[VolumeAttachment]:
+        """List this pod's attachments, including ``FAILED`` ones."""
         body = await self._request(
             "GET", _VOLUMES_PATH, timeout_sec=_LOOKUP_TIMEOUT_SEC
         )
-        return _parse(_VolumeList, body).volumes
+        return _parse(_AttachmentList, body).volumes
 
-    async def get_volume(self, attachment_id: str) -> VolumeAttachment:
+    async def get_attachment(self, attachment_id: str) -> VolumeAttachment:
+        """Return one attachment by id, whatever its state."""
         body = await self._request(
             "GET", _volume_path(attachment_id), timeout_sec=_LOOKUP_TIMEOUT_SEC
         )
         return _parse(VolumeAttachment, body)
 
     async def detach(self, attachment_id: str) -> None:
+        """Remove the attachment's bind from ``/bdn/mounts``. Returns once it is gone."""
         await self._request("DELETE", _volume_path(attachment_id))
 
     async def healthy(self) -> bool:
+        """Whether the daemon answers right now. See :meth:`HotLoadClient.healthy`."""
         try:
             await self._request(
                 "GET", _HEALTH_PATH, timeout_sec=_LOOKUP_TIMEOUT_SEC, max_retries=0
@@ -357,6 +366,7 @@ class AsyncHotLoadClient:
         return True
 
     async def close(self) -> None:
+        """Close the HTTP client if this object owns it. Attachments are unaffected."""
         if self.close_http_client_on_close:
             await self._http_client.aclose()
 
@@ -396,8 +406,44 @@ class AsyncHotLoadClient:
         raise AssertionError("unreachable: the retry loop returns or raises")
 
 
-class _VolumeList(BaseModel):
+class _AttachmentList(BaseModel):
     volumes: list[VolumeAttachment]
+
+
+def _unix_socket_client(socket_path: Path, *, timeout_sec: float) -> httpx.Client:
+    return httpx.Client(
+        transport=httpx.HTTPTransport(uds=str(socket_path)),
+        base_url=SOCKET_BASE_URL,
+        timeout=_request_timeout(timeout_sec),
+        headers=_default_headers(),
+    )
+
+
+def _unix_socket_async_client(
+    socket_path: Path, *, timeout_sec: float
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
+        base_url=SOCKET_BASE_URL,
+        timeout=_request_timeout(timeout_sec),
+        headers=_default_headers(),
+    )
+
+
+def _request_timeout(read_timeout_sec: float) -> httpx.Timeout:
+    return httpx.Timeout(read_timeout_sec, connect=_CONNECT_TIMEOUT_SEC)
+
+
+def _default_headers() -> dict[str, str]:
+    return {"Accept": "application/json", "User-Agent": _user_agent()}
+
+
+@functools.cache
+def _user_agent() -> str:
+    try:
+        return f"baseten-bdn/{version('baseten-bdn')}"
+    except PackageNotFoundError:
+        return "baseten-bdn/unknown"
 
 
 def _attempts(options: HotLoadClientOptions, max_retries: int | None) -> int:
@@ -405,7 +451,7 @@ def _attempts(options: HotLoadClientOptions, max_retries: int | None) -> int:
 
 
 def _timeout(options: HotLoadClientOptions, timeout_sec: float | None) -> httpx.Timeout:
-    return _http.request_timeout(
+    return _request_timeout(
         options.request_timeout_sec if timeout_sec is None else timeout_sec
     )
 
@@ -419,20 +465,6 @@ def _attach_request(
     if exclude:
         body["exclude"] = list(exclude)
     return body
-
-
-def _idempotency_key(key: str | None) -> str:
-    if key is None:
-        return uuid.uuid4().hex
-    if not (
-        1 <= len(key) <= _MAX_IDEMPOTENCY_KEY_BYTES
-        and key.isascii()
-        and key.isprintable()
-    ):
-        raise ValueError(
-            f"idempotency_key must be 1 to {_MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters"
-        )
-    return key
 
 
 def _volume_path(attachment_id: str) -> str:
@@ -485,7 +517,7 @@ def _classify_response(response: httpx.Response) -> bytes:
     if 200 <= response.status_code < 300:
         return response.content
     try:
-        parsed = _http.ErrorBody.model_validate_json(response.content)
+        parsed = ErrorBody.model_validate_json(response.content)
     except ValidationError as error:
         raise HotLoadProtocolError(
             f"Hot Load returned HTTP {response.status_code} without a valid error body"
