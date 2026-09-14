@@ -12,6 +12,25 @@ other Baseten SDKs such as `baseten` and `baseten-loops`.
 pip install baseten-bdn
 ```
 
+## Hot Load
+
+Inside a model pod that is opted in to BDN Hot Load, `baseten.bdn.hotload`
+attaches BDN volumes below `/bdn/mounts` at runtime. An attach returns once the
+directory is readable.
+
+```python
+from baseten.bdn.hotload import HotLoadClient
+
+with HotLoadClient() as hotload:
+    adapter = hotload.attach("bdn:adapters/sql-lora@b3:2547…", target="sql-lora")
+
+load_adapter(adapter.path)  # /bdn/mounts/sql-lora
+```
+
+`AsyncHotLoadClient` offers the same methods as coroutines. Attachments belong
+to the pod and stay mounted after the client is closed; call `detach` to free a
+target name for reuse.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/).

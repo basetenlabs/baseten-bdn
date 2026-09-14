@@ -4,15 +4,17 @@ version = "0.0.1"
 description = "Python SDK for working with BDN inside and outside Baseten"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dependencies = []
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.0",
+]
 
 [dependency-groups]
 dev = [
@@ -44,7 +46,7 @@ sequence = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I"]
