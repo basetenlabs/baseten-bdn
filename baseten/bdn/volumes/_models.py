@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ResolvedFrom(StrEnum):
+    """How cannery chose the version: the volume head, a tag, or a digest pin."""
+
     HEAD = "head"
     TAG = "tag"
     PIN = "pin"
@@ -33,6 +35,8 @@ class ResolvedVolume(BaseModel):
 
 
 class EntryKind(StrEnum):
+    """What a manifest entry materializes as."""
+
     FILE = "file"
     DIRECTORY = "directory"
     SYMLINK = "symlink"
@@ -58,15 +62,21 @@ class FileInfo(BaseModel):
 
 
 class PullResult(BaseModel):
+    """What a completed pull wrote."""
+
     model_config = ConfigDict(frozen=True)
 
     reference: str
+    """The canonical ref that was pulled."""
+
     digest: str
+    """Manifest digest of the version that was pulled; pin this to pull the same bytes again."""
+
     dest_dir: Path
-    files: int = Field(ge=0)
+    file_count: int = Field(ge=0)
     """Regular files written, hardlinks included."""
 
-    bytes: int = Field(ge=0)
+    bytes_written: int = Field(ge=0)
     """Bytes of file content written."""
 
     duration_sec: float = Field(ge=0)
@@ -76,8 +86,16 @@ class VolumeError(Exception):
     """Base class for every error raised by the volumes client."""
 
 
+class VolumeRefError(VolumeError, ValueError):
+    """A volume ref string does not parse."""
+
+
+class VolumeUnsupportedError(VolumeError, NotImplementedError):
+    """The volume or platform uses something this client does not support yet."""
+
+
 class VolumeConnectionError(VolumeError):
-    """A request to the Baseten API, cannery, or S3 could not complete."""
+    """A request to the Baseten API, cannery, or the origin bucket could not complete."""
 
 
 class VolumeAPIError(VolumeError):
@@ -109,6 +127,26 @@ class VolumeAPIError(VolumeError):
         return f"{self.service} request failed with HTTP {self.status_code} ({label}): {self.message}"
 
 
+class VolumeStorageError(VolumeError):
+    """The origin bucket refused an object read.
+
+    ``code`` is the S3 error code (``AccessDenied``, ``NoSuchKey``, ...) when
+    the response carried one.
+    """
+
+    def __init__(
+        self, status_code: int, key: str, message: str, *, code: str | None = None
+    ) -> None:
+        super().__init__(status_code, key, message, code)
+        self.status_code = status_code
+        self.key = key
+        self.message = message
+        self.code = code
+
+    def __str__(self) -> str:
+        return f"origin bucket answered HTTP {self.status_code} ({self.code or 'error'}) for {self.key}: {self.message}"
+
+
 class VolumeProtocolError(VolumeError):
     """A response does not match the contract: bad JSON, unknown content type, bad manifest."""
 
@@ -119,3 +157,7 @@ class VolumeIntegrityError(VolumeError):
 
 class VolumePathError(VolumeError):
     """A manifest entry would land outside the destination directory."""
+
+
+class VolumeDestinationError(VolumeError):
+    """The destination directory cannot take the volume: not a directory, no space, or unwritable."""

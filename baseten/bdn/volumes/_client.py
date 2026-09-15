@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import secrets
+import shutil
+import sys
 import threading
 import time
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import httpx
 
+from baseten.bdn._useragent import user_agent
 from baseten.bdn.volumes import _cannery, _manifest, _materialize, _s3
 from baseten.bdn.volumes._cannery import (
     OriginCredentials,
@@ -32,11 +36,12 @@ from baseten.bdn.volumes._cannery import (
     VolumeRef,
 )
 from baseten.bdn.volumes._manifest import (
+    ChunkEntry,
     ChunkFileEntry,
     ChunkmapFileEntry,
     DirectoryEntry,
+    FileEntry,
     Manifest,
-    SlabmapFileEntry,
     SymlinkEntry,
 )
 from baseten.bdn.volumes._models import (
@@ -44,7 +49,9 @@ from baseten.bdn.volumes._models import (
     PullResult,
     ResolvedVolume,
     VolumeConnectionError,
+    VolumeDestinationError,
     VolumeIntegrityError,
+    VolumeUnsupportedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +84,7 @@ class VolumesClientOptions:
     """In-flight object reads during a pull."""
 
     max_bytes_in_flight: int = DEFAULT_MAX_BYTES_IN_FLIGHT
-    """Bound on decompressed chunk bytes buffered in memory during a pull."""
+    """Bound on chunk bytes buffered in memory during a pull, compressed and decoded copies included."""
 
     request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC
     """Read bound on one HTTP request to any of the three services."""
@@ -94,6 +101,7 @@ class VolumesClientOptions:
 
     @property
     def base_url(self) -> str:
+        """The Baseten API base URL in effect."""
         return self.base_url_override or DEFAULT_BASE_URL
 
 
@@ -142,7 +150,7 @@ class VolumesClient:
         )
         self._timeout = httpx.Timeout(request_timeout_sec, connect=_CONNECT_TIMEOUT_SEC)
         self._http_client = (
-            httpx.Client(timeout=self._timeout, headers={"User-Agent": _user_agent()})
+            httpx.Client(timeout=self._timeout, headers={"User-Agent": user_agent()})
             if http_client_override is None
             else http_client_override
         )
@@ -182,88 +190,77 @@ class VolumesClient:
         return self._fetch_manifest(store, parsed, resolution).file_infos()
 
     def pull(self, ref: str, dest_dir: str | Path) -> PullResult:
-        """Materialize the version ``ref`` names below ``dest_dir``.
+        """Materialize the version ``ref`` names at ``dest_dir``.
 
-        Writes in place: an existing tree at ``dest_dir`` is overwritten entry
-        by entry, and a failure leaves what was written so far. Every object
-        is verified against its recorded BLAKE3 digest before it is written.
+        When ``dest_dir`` does not exist yet, the tree is built in a sibling
+        staging directory and renamed into place at the end, so a failed pull
+        leaves nothing behind. When it exists, entries are written into it in
+        place and a failure leaves what was written so far. Every object is
+        verified against its recorded BLAKE3 digest before it is written.
 
         Raises:
             VolumePathError: The manifest would place an entry outside
                 ``dest_dir``; nothing is written.
+            VolumeDestinationError: ``dest_dir`` cannot take the volume: too
+                little free space, or a file where a directory is needed.
             VolumeIntegrityError: A downloaded object failed its digest or
                 length check.
-            VolumeAPIError: The Baseten API, cannery, or the origin bucket
-                rejected a request.
-            NotImplementedError: The manifest uses a feature this client does
-                not support (slabmap files, or symlinks and hardlinks on
-                Windows).
+            VolumeAPIError: The Baseten API or cannery rejected a request.
+            VolumeStorageError: The origin bucket refused an object read.
+            VolumeUnsupportedError: The volume uses slabmap files, or this is
+                not a POSIX platform.
         """
+        if sys.platform == "win32":
+            raise VolumeUnsupportedError(
+                "pulling volumes is supported on Linux and macOS only"
+            )
         started = time.perf_counter()
         parsed = VolumeRef.parse(ref)
-        root = Path(dest_dir)
+        dest = Path(dest_dir)
         resolution = self._resolve(parsed)
         store = self._object_store(parsed, resolution)
         manifest = self._fetch_manifest(store, parsed, resolution)
         contained = _manifest.ContainedPaths(manifest.entries)
-        groups = _manifest.hardlink_groups(manifest.entries)
-        linked = {path for paths in groups.values() for path in paths[1:]}
-
+        _check_free_space(dest, manifest.header.total_size)
         logger.info(
             "pull %s: %d entries, %d bytes -> %s",
             resolution.resolved.reference,
             len(manifest.entries),
             manifest.header.total_size,
-            root,
+            dest,
         )
-        root.mkdir(parents=True, exist_ok=True)
-        # Directories first so every file has a parent; their modes last, so a
-        # read-only directory cannot block its own children.
-        directory_modes: list[tuple[Path, int]] = []
-        for entry in manifest.entries:
-            if isinstance(entry, DirectoryEntry):
-                path = _materialize.ensure_dir(root, entry.clean_path)
-                directory_modes.append((path, entry.mode_bits))
-        for entry in manifest.entries:
-            if isinstance(entry, SymlinkEntry):
-                path = _materialize.contained_join(root, entry.clean_path)
-                _materialize.ensure_dir(root, entry.clean_path.rpartition("/")[0])
-                _materialize.create_symlink(
-                    path, contained.rendered_symlink_target(entry)
-                )
 
-        files = [
-            entry
-            for entry in manifest.entries
-            if isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry, SlabmapFileEntry))
-            and entry.clean_path not in linked
-        ]
-        for entry in files:
-            if isinstance(entry, SlabmapFileEntry):
-                raise NotImplementedError(
-                    f"slabmap files are not supported: {entry.path!r}"
-                )
-        written = _PullWorker(store, parsed, resolution, root, self._options).run(files)
+        staging = None if dest.exists() else _staging_dir(dest)
+        root = staging or dest
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            materializer = _Materializer(
+                store, parsed, resolution, root, contained, self._options
+            )
+            written, file_count = materializer.run(manifest)
+            if staging is not None:
+                staging.rename(dest)
+        except BaseException:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
 
-        for paths in groups.values():
-            source = _materialize.contained_join(root, paths[0])
-            for path in paths[1:]:
-                _materialize.ensure_dir(root, path.rpartition("/")[0])
-                _materialize.create_hardlink(
-                    _materialize.contained_join(root, path), source
-                )
-        for path, mode in sorted(
-            directory_modes, key=lambda item: len(item[0].parts), reverse=True
-        ):
-            _materialize.apply_mode(path, mode)
-
+        duration = time.perf_counter() - started
+        logger.info(
+            "pull %s done: %d files, %d bytes in %.1fs -> %s",
+            resolution.resolved.reference,
+            file_count,
+            written,
+            duration,
+            dest,
+        )
         return PullResult(
             reference=resolution.resolved.reference,
             digest=resolution.resolved.origin_digest,
-            dest_dir=root,
-            files=len(files) + len(linked),
-            bytes=written,
-            duration_sec=time.perf_counter() - started,
+            dest_dir=dest,
+            file_count=file_count,
+            bytes_written=written,
+            duration_sec=duration,
         )
 
     def close(self) -> None:
@@ -283,15 +280,12 @@ class VolumesClient:
             cached = self._tokens.get(key)
             if cached is not None and cached.expires_at - _now() > _EXPIRY_MARGIN:
                 return cached
-            try:
-                response = self._http_client.post(
-                    f"{self._options.base_url}{_TOKEN_PATH}",
-                    json=_cannery.token_request(ref),
-                    headers={"Authorization": f"Bearer {self._options.api_key}"},
-                    timeout=self._timeout,
-                )
-            except httpx.HTTPError as error:
-                raise _cannery.connection_error("the Baseten API", error) from error
+            response = self._post_with_retry(
+                "the Baseten API",
+                f"{self._options.base_url}{_TOKEN_PATH}",
+                json=_cannery.token_request(ref),
+                headers={"Authorization": f"Bearer {self._options.api_key}"},
+            )
             _cannery.raise_for_baseten_error(response)
             token = _cannery.parse_json(TokenResponse, response, "volume token")
             self._tokens[key] = token
@@ -307,46 +301,61 @@ class VolumesClient:
 
     def _resolve(self, ref: VolumeRef) -> ResolveResponse:
         token = self._token(ref)
-        try:
-            response = self._http_client.post(
-                f"{self._bdn_endpoint(token)}{_RESOLVE_PATH}",
-                params={"ref": ref.canonical()},
-                headers={"Authorization": f"Bearer {token.token}"},
-                timeout=self._timeout,
-            )
-        except httpx.HTTPError as error:
-            raise _cannery.connection_error("cannery", error) from error
+        response = self._post_with_retry(
+            "cannery",
+            f"{self._bdn_endpoint(token)}{_RESOLVE_PATH}",
+            params={"ref": ref.canonical()},
+            headers={"Authorization": f"Bearer {token.token}"},
+        )
         _cannery.raise_for_cannery_error(response)
         return _cannery.parse_json(ResolveResponse, response, "resolve")
 
-    def _object_store(self, ref: VolumeRef, first: ResolveResponse) -> _s3.ObjectStore:
-        current = {"resolution": first}
-        lock = threading.Lock()
-
-        def credentials() -> OriginCredentials:
-            with lock:
-                origin = current["resolution"].origin
-                if (
-                    origin.expires_at is not None
-                    and origin.expires_at - _now() <= _EXPIRY_MARGIN
+    def _post_with_retry(
+        self,
+        service: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> httpx.Response:
+        # Both POSTs are safe to repeat: a token mint and a resolve change no
+        # state beyond issuing another short-lived credential.
+        for attempt in range(1, _s3.ATTEMPTS + 1):
+            try:
+                response = self._http_client.post(
+                    url,
+                    json=json,
+                    params=params,
+                    headers=headers,
+                    timeout=self._timeout,
+                )
+            except httpx.HTTPError as error:
+                if attempt == _s3.ATTEMPTS or not isinstance(
+                    error, httpx.TransportError
                 ):
-                    logger.info(
-                        "origin credentials near expiry; resolving %s again",
-                        ref.canonical(),
-                    )
-                    current["resolution"] = self._resolve(ref)
-                    origin = current["resolution"].origin
-                return origin
+                    raise _cannery.connection_error(service, error) from error
+            else:
+                if attempt == _s3.ATTEMPTS or not _s3.is_retryable_status(
+                    response.status_code
+                ):
+                    return response
+            time.sleep(_s3.backoff_sec(attempt))
+        raise AssertionError("unreachable: the retry loop returns or raises")
 
-        return _s3.ObjectStore(self._http_client, credentials, timeout=self._timeout)
+    def _object_store(self, ref: VolumeRef, first: ResolveResponse) -> _s3.ObjectStore:
+        # Refreshes re-resolve the pinned digest, never the tag: the tag may
+        # have moved or vanished while this version is still being read.
+        pinned = ref.pinned(first.resolved.origin_digest)
+        source = _CredentialSource(first.origin, lambda: self._resolve(pinned).origin)
+        return _s3.ObjectStore(self._http_client, source, timeout=self._timeout)
 
     def _fetch_manifest(
         self, store: _s3.ObjectStore, ref: VolumeRef, resolution: ResolveResponse
     ) -> Manifest:
         resolved = resolution.resolved
-        body, content_type = store.get(
-            resolved.target.key(resolved.org_id, ref.namespace)
-        )
+        key = _object_key(resolved.org_id, ref.namespace, resolved.target.relative_key)
+        body, content_type = store.get(key)
         data = _s3.decode_object(
             body,
             content_type,
@@ -356,8 +365,33 @@ class VolumesClient:
         return _manifest.parse_manifest(data)
 
 
-class _PullWorker:
-    """Fans chunk reads out over a thread pool, bounded by a byte budget."""
+class _CredentialSource:
+    """Current origin credentials, re-resolved before they expire or when the bucket rejects them."""
+
+    def __init__(
+        self, first: OriginCredentials, resolve: Callable[[], OriginCredentials]
+    ) -> None:
+        self._current = first
+        self._resolve = resolve
+        self._lock = threading.Lock()
+
+    def current(self) -> OriginCredentials:
+        with self._lock:
+            expires_at = self._current.expires_at
+            if expires_at is not None and expires_at - _now() <= _EXPIRY_MARGIN:
+                logger.info("origin credentials near expiry; resolving again")
+                self._current = self._resolve()
+            return self._current
+
+    def refresh(self) -> OriginCredentials:
+        with self._lock:
+            logger.info("origin bucket rejected the credentials; resolving again")
+            self._current = self._resolve()
+            return self._current
+
+
+class _Materializer:
+    """Writes one manifest below ``root``, fanning chunk reads out over a thread pool."""
 
     def __init__(
         self,
@@ -365,73 +399,134 @@ class _PullWorker:
         ref: VolumeRef,
         resolution: ResolveResponse,
         root: Path,
+        contained: _manifest.ContainedPaths,
         options: VolumesClientOptions,
     ) -> None:
         self._store = store
         self._namespace = ref.namespace
         self._org_id = resolution.resolved.org_id
         self._root = root
+        self._contained = contained
         self._options = options
         self._budget = _materialize.ByteBudget(options.max_bytes_in_flight)
 
-    def run(
-        self, files: Sequence[ChunkFileEntry | ChunkmapFileEntry | SlabmapFileEntry]
-    ) -> int:
-        # Chunkmaps are fetched first so chunk work is one flat list; nesting
-        # pool submissions would let workers block on workers.
-        with ThreadPoolExecutor(max_workers=self._options.max_concurrency) as pool:
-            plans = list(pool.map(self._plan_file, files))
-            chunk_jobs = [(path, chunk) for path, chunks in plans for chunk in chunks]
-            # Consume the iterator so a worker's exception propagates here.
-            for _ in pool.map(self._fetch_chunk, chunk_jobs):
-                pass
-        for entry in files:
-            _materialize.apply_mode(
-                _materialize.contained_join(self._root, entry.clean_path),
-                entry.mode_bits,
-            )
-        return sum(chunk.length for _, chunk in chunk_jobs)
+    def run(self, manifest: Manifest) -> tuple[int, int]:
+        """Return bytes written and regular files created, hardlinks included."""
+        entries = manifest.entries
+        groups = _manifest.hardlink_groups(entries)
+        linked = {path for paths in groups.values() for path in paths[1:]}
+        files: list[FileEntry] = [
+            entry
+            for entry in entries
+            if isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry))
+            and entry.clean_path not in linked
+        ]
 
-    def _plan_file(
-        self, entry: ChunkFileEntry | ChunkmapFileEntry | SlabmapFileEntry
-    ) -> tuple[Path, list[_manifest.ChunkEntry]]:
-        path = _materialize.contained_join(self._root, entry.clean_path)
-        _materialize.ensure_dir(self._root, entry.clean_path.rpartition("/")[0])
+        # Every directory first, recorded or implied, on one thread: the pool
+        # then never races on mkdir. Modes come last, deepest first, so a
+        # read-only directory cannot block its own children.
+        for path in _manifest.implicit_directories(entries):
+            _materialize.ensure_dir(self._root, path)
+        directory_modes: list[tuple[Path, int]] = []
+        for entry in entries:
+            if isinstance(entry, DirectoryEntry):
+                path = _materialize.ensure_dir(self._root, entry.clean_path)
+                directory_modes.append((path, entry.mode_bits))
+            elif isinstance(entry, SymlinkEntry):
+                _materialize.create_symlink(
+                    self._join(entry.clean_path),
+                    self._contained.rendered_symlink_target(entry),
+                )
+
+        written = self._fetch_files(files)
+
+        for paths in groups.values():
+            source = self._join(paths[0])
+            for path in paths[1:]:
+                _materialize.create_hardlink(self._join(path), source)
+        for entry in files:
+            _materialize.apply_mode(self._join(entry.clean_path), entry.mode_bits)
+        deepest_first = sorted(
+            directory_modes, key=lambda item: len(item[0].parts), reverse=True
+        )
+        for path, mode in deepest_first:
+            _materialize.apply_mode(path, mode)
+        return written, len(files) + len(linked)
+
+    def _join(self, entry_path: str) -> Path:
+        return _materialize.contained_join(self._root, entry_path)
+
+    def _fetch_files(self, files: Sequence[FileEntry]) -> int:
+        # Chunkmap reads are planned on the pool and their chunks submitted as
+        # each plan lands, so payload transfer starts before every chunkmap is
+        # in. Only the main thread submits, so no worker ever waits on another.
+        with ThreadPoolExecutor(max_workers=self._options.max_concurrency) as pool:
+            plans = [pool.submit(self._plan_file, entry) for entry in files]
+            fetches: list[Future[int]] = []
+            for plan in as_completed(plans):
+                path, chunks = plan.result()
+                fetches.extend(
+                    pool.submit(self._fetch_chunk, path, chunk) for chunk in chunks
+                )
+            return sum(fetch.result() for fetch in fetches)
+
+    def _plan_file(self, entry: FileEntry) -> tuple[Path, list[ChunkEntry]]:
+        path = self._join(entry.clean_path)
         if isinstance(entry, ChunkFileEntry):
             _materialize.create_file(path, entry.size)
-            return path, [entry.chunk] if entry.chunk else []
-        if isinstance(entry, ChunkmapFileEntry):
-            body, content_type = self._store.get(
-                entry.target.key(self._org_id, self._namespace)
-            )
-            data = _s3.decode_object(
-                body,
-                content_type,
-                expected_kind="chunkmap",
-                expected_digest=entry.digest,
-            )
-            chunks = _manifest.parse_chunkmap(data, entry.size)
-            _materialize.create_file(path, entry.size)
-            return path, list(chunks)
-        raise NotImplementedError(f"slabmap files are not supported: {entry.path!r}")
+            # An empty file's chunk is the empty digest; nothing to fetch.
+            return path, [entry.chunk] if entry.chunk.length else []
+        body, content_type = self._store.get(self._key(entry.target.relative_key))
+        data = _s3.decode_object(
+            body, content_type, expected_kind="chunkmap", expected_digest=entry.digest
+        )
+        chunks = _manifest.parse_chunkmap(data, entry.size)
+        _materialize.create_file(path, entry.size)
+        return path, list(chunks)
 
-    def _fetch_chunk(self, job: tuple[Path, _manifest.ChunkEntry]) -> None:
-        path, chunk = job
-        self._budget.acquire(chunk.length)
+    def _fetch_chunk(self, path: Path, chunk: ChunkEntry) -> int:
+        # Compressed body and decoded bytes coexist until the write, so the
+        # budget is charged for both copies.
+        charge = 2 * chunk.length
+        self._budget.acquire(charge)
         try:
-            body, content_type = self._store.get(
-                chunk.target.key(self._org_id, self._namespace)
-            )
+            body, content_type = self._store.get(self._key(chunk.target.relative_key))
             data = _s3.decode_object(
                 body, content_type, expected_kind="chunk", expected_digest=chunk.digest
             )
+            del body
             if len(data) != chunk.length:
                 raise VolumeIntegrityError(
                     f"chunk {chunk.digest} is {len(data)} bytes, the record says {chunk.length}"
                 )
             _materialize.write_at(path, chunk.offset, data)
+            return chunk.length
         finally:
-            self._budget.release(chunk.length)
+            self._budget.release(charge)
+
+    def _key(self, relative_key: str) -> str:
+        return _object_key(self._org_id, self._namespace, relative_key)
+
+
+def _object_key(org_id: str, namespace: str, relative_key: str) -> str:
+    return f"bdn/{org_id}/{namespace}/{relative_key}"
+
+
+def _staging_dir(dest: Path) -> Path:
+    return dest.parent / f".{dest.name}.partial-{secrets.token_hex(4)}"
+
+
+def _check_free_space(dest: Path, total_size: int) -> None:
+    probe = (
+        dest
+        if dest.exists()
+        else next(parent for parent in dest.parents if parent.exists())
+    )
+    free = shutil.disk_usage(probe).free
+    if free < total_size:
+        raise VolumeDestinationError(
+            f"{dest} has {free} bytes free, the volume needs {total_size}; nothing was written"
+        )
 
 
 def _public_resolved(resolution: ResolveResponse) -> ResolvedVolume:
@@ -447,12 +542,3 @@ def _public_resolved(resolution: ResolveResponse) -> ResolvedVolume:
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
-
-
-def _user_agent() -> str:
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        return f"baseten-bdn/{version('baseten-bdn')}"
-    except PackageNotFoundError:
-        return "baseten-bdn/unknown"

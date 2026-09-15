@@ -45,11 +45,14 @@ from baseten.bdn.volumes import VolumesClient
 with VolumesClient(api_key="...") as volumes:
     result = volumes.pull("bdn:loops/sampler-abc123:step-100", "./checkpoint")
 
-print(result.files, result.bytes)
+print(result.file_count, result.bytes_written)
 ```
 
 Refs are `bdn:<namespace>/<volume>` with an optional `:<tag>` or `@<digest>`.
-A pull writes in place and overwrites an existing tree entry by entry.
+A pull into a new directory is atomic: the tree is staged next to it and
+renamed into place, so a failed pull leaves nothing behind. A pull into an
+existing directory overwrites it entry by entry. Pulling is supported on
+Linux and macOS.
 
 ## Development
 

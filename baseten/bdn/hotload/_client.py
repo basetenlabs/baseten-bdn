@@ -21,19 +21,18 @@ Wire contract (HTTP+JSON over the socket):
 from __future__ import annotations
 
 import asyncio
-import functools
 import re
 import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Self, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from baseten.bdn._useragent import user_agent
 from baseten.bdn.hotload._models import (
     AttachmentState,
     ErrorBody,
@@ -435,15 +434,7 @@ def _request_timeout(read_timeout_sec: float) -> httpx.Timeout:
 
 
 def _default_headers() -> dict[str, str]:
-    return {"Accept": "application/json", "User-Agent": _user_agent()}
-
-
-@functools.cache
-def _user_agent() -> str:
-    try:
-        return f"baseten-bdn/{version('baseten-bdn')}"
-    except PackageNotFoundError:
-        return "baseten-bdn/unknown"
+    return {"Accept": "application/json", "User-Agent": user_agent()}
 
 
 def _attempts(options: HotLoadClientOptions, max_retries: int | None) -> int:

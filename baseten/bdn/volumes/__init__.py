@@ -13,10 +13,14 @@ from baseten.bdn.volumes._models import (
     ResolvedVolume,
     VolumeAPIError,
     VolumeConnectionError,
+    VolumeDestinationError,
     VolumeError,
     VolumeIntegrityError,
     VolumePathError,
     VolumeProtocolError,
+    VolumeRefError,
+    VolumeStorageError,
+    VolumeUnsupportedError,
 )
 
 __all__ = [
@@ -27,10 +31,14 @@ __all__ = [
     "ResolvedVolume",
     "VolumeAPIError",
     "VolumeConnectionError",
+    "VolumeDestinationError",
     "VolumeError",
     "VolumeIntegrityError",
     "VolumePathError",
     "VolumeProtocolError",
+    "VolumeRefError",
+    "VolumeStorageError",
+    "VolumeUnsupportedError",
     "VolumesClient",
     "VolumesClientOptions",
 ]

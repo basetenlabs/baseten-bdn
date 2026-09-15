@@ -8,12 +8,18 @@ large file's record points at.
 
 from __future__ import annotations
 
-import json
 import posixpath
 from collections import defaultdict
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from baseten.bdn.volumes._cannery import DIGEST_PATTERN, ObjectTarget
 from baseten.bdn.volumes._models import (
@@ -21,6 +27,7 @@ from baseten.bdn.volumes._models import (
     FileInfo,
     VolumePathError,
     VolumeProtocolError,
+    VolumeUnsupportedError,
 )
 
 MAX_SYMLINK_HOPS = 40
@@ -74,16 +81,24 @@ class SymlinkEntry(_PathEntry):
 
 
 class ChunkFileEntry(_PathEntry):
-    """A file of at most one chunk; an empty file has none."""
+    """A file stored as one chunk; an empty file has a zero-length chunk."""
 
     type: Literal["file"] = Field(alias="_type")
     kind: Literal["chunk"] = Field(alias="_kind")
-    chunk: ChunkEntry | None = None
+    chunk: ChunkEntry
     link_group: int | None = None
+
+    @model_validator(mode="after")
+    def _chunk_starts_at_zero(self) -> ChunkFileEntry:
+        if self.chunk.offset != 0:
+            raise ValueError(
+                f"single-chunk file {self.path!r} has chunk offset {self.chunk.offset}"
+            )
+        return self
 
     @property
     def size(self) -> int:
-        return self.chunk.length if self.chunk else 0
+        return self.chunk.length
 
 
 class ChunkmapFileEntry(_PathEntry):
@@ -98,26 +113,26 @@ class ChunkmapFileEntry(_PathEntry):
 
 
 class SlabmapFileEntry(_PathEntry):
+    """Recognized so the manifest parses; rejected because nothing reads slabmaps yet."""
+
     type: Literal["file"] = Field(alias="_type")
     kind: Literal["slabmap"] = Field(alias="_kind")
-    link_group: int | None = None
 
 
-FileEntry = Annotated[
-    ChunkFileEntry | ChunkmapFileEntry | SlabmapFileEntry, Field(discriminator="kind")
-]
-PathEntry = (
-    DirectoryEntry
+FileEntry = ChunkFileEntry | ChunkmapFileEntry
+PathEntry = DirectoryEntry | SymlinkEntry | ChunkFileEntry | ChunkmapFileEntry
+_ManifestRecord = Annotated[
+    ManifestHeader
+    | Provenance
+    | DirectoryEntry
     | SymlinkEntry
-    | ChunkFileEntry
-    | ChunkmapFileEntry
-    | SlabmapFileEntry
-)
-ManifestRecord = Annotated[
-    ManifestHeader | Provenance | DirectoryEntry | SymlinkEntry | FileEntry,
+    | Annotated[
+        ChunkFileEntry | ChunkmapFileEntry | SlabmapFileEntry,
+        Field(discriminator="kind"),
+    ],
     Field(discriminator="type"),
 ]
-_MANIFEST_RECORD = TypeAdapter(ManifestRecord)
+_MANIFEST_RECORD = TypeAdapter(_ManifestRecord)
 
 
 class ChunkmapHeader(_Record):
@@ -130,8 +145,8 @@ class ChunkmapChunk(ChunkEntry):
     type: Literal["chunk"] = Field(alias="_type")
 
 
-ChunkmapRecord = Annotated[ChunkmapHeader | ChunkmapChunk, Field(discriminator="type")]
-_CHUNKMAP_RECORD = TypeAdapter(ChunkmapRecord)
+_ChunkmapRecord = Annotated[ChunkmapHeader | ChunkmapChunk, Field(discriminator="type")]
+_CHUNKMAP_RECORD = TypeAdapter(_ChunkmapRecord)
 
 
 class Manifest(BaseModel):
@@ -144,37 +159,20 @@ class Manifest(BaseModel):
         infos: list[FileInfo] = []
         for entry in self.entries:
             if isinstance(entry, DirectoryEntry):
-                infos.append(
-                    FileInfo(
-                        path=entry.clean_path,
-                        kind=EntryKind.DIRECTORY,
-                        size=0,
-                        mode=entry.mode_bits,
-                    )
-                )
+                kind, size, target = EntryKind.DIRECTORY, 0, None
             elif isinstance(entry, SymlinkEntry):
-                infos.append(
-                    FileInfo(
-                        path=entry.clean_path,
-                        kind=EntryKind.SYMLINK,
-                        size=0,
-                        mode=entry.mode_bits,
-                        link_target=entry.target,
-                    )
-                )
-            elif isinstance(entry, SlabmapFileEntry):
-                raise NotImplementedError(
-                    f"slabmap files are not supported: {entry.path!r}"
-                )
+                kind, size, target = EntryKind.SYMLINK, 0, entry.target
             else:
-                infos.append(
-                    FileInfo(
-                        path=entry.clean_path,
-                        kind=EntryKind.FILE,
-                        size=entry.size,
-                        mode=entry.mode_bits,
-                    )
+                kind, size, target = EntryKind.FILE, entry.size, None
+            infos.append(
+                FileInfo(
+                    path=entry.clean_path,
+                    kind=kind,
+                    size=size,
+                    mode=entry.mode_bits,
+                    link_target=target,
                 )
+            )
         return infos
 
 
@@ -201,14 +199,14 @@ def parse_manifest(body: bytes) -> Manifest:
             header = record
         elif isinstance(record, Provenance):
             continue
+        elif isinstance(record, SlabmapFileEntry):
+            raise VolumeUnsupportedError(
+                f"slabmap files are not supported yet: {record.path!r}"
+            )
         else:
             entries.append(record)
     if header is None:
         raise VolumeProtocolError("manifest has no manifest_header record")
-    if header.entry_count != len(entries):
-        raise VolumeProtocolError(
-            f"manifest header counts {header.entry_count} entries, found {len(entries)}"
-        )
     return Manifest(header=header, entries=tuple(entries))
 
 
@@ -273,9 +271,11 @@ class ContainedPaths:
     """Every entry path and symlink target, checked to stay inside the tree.
 
     Runs before anything is written, so a hostile or corrupt manifest cannot
-    place a single byte outside ``dest_dir``. Also renders each symlink's
-    target relative to the link, the only encoding that survives relocating
-    the tree.
+    place a single byte outside ``dest_dir``. Symlink targets are walked one
+    component at a time with symlinks followed at every component, so a
+    ``..`` after a link that itself points upward is counted against the real
+    location, not the spelled one. Also renders each symlink's target
+    relative to the link, the only encoding that survives relocating the tree.
     """
 
     def __init__(self, entries: tuple[PathEntry, ...]) -> None:
@@ -291,10 +291,16 @@ class ContainedPaths:
             if path in self.by_path:
                 raise VolumePathError(f"entry path appears twice: {path!r}")
             self.by_path[path] = entry
+        self._rendered: dict[str, str] = {}
         for path, entry in self.by_path.items():
             self._check_ancestors(path)
             if isinstance(entry, SymlinkEntry):
-                self._resolve_symlink(path, entry)
+                self._real_target(path, entry.target, hops=0)
+                self._rendered[path] = self._render(path, entry.target)
+
+    def rendered_symlink_target(self, entry: SymlinkEntry) -> str:
+        """The target relative to the link's directory."""
+        return self._rendered[entry.clean_path]
 
     def _check_ancestors(self, path: str) -> None:
         parent = posixpath.dirname(path)
@@ -306,43 +312,45 @@ class ContainedPaths:
                 )
             parent = posixpath.dirname(parent)
 
-    def _target_path(self, link_path: str, target: str) -> str:
-        if "\x00" in target or not target:
+    def _real_target(self, link_path: str, target: str, *, hops: int) -> list[str]:
+        """Resolve ``target`` from ``link_path`` to real components inside the tree."""
+        if not target or "\x00" in target:
             raise VolumePathError(
                 f"symlink {link_path!r} has an empty target or a NUL byte"
             )
-        base = "" if target.startswith("/") else posixpath.dirname(link_path)
-        try:
-            return _normalize(posixpath.join(base, target))
-        except VolumePathError:
+        if hops > MAX_SYMLINK_HOPS:
             raise VolumePathError(
-                f"symlink {link_path!r} -> {target!r} escapes the volume root"
-            ) from None
-
-    def _resolve_symlink(self, link_path: str, entry: SymlinkEntry) -> None:
-        current = link_path
-        target = entry.target
-        for _ in range(MAX_SYMLINK_HOPS):
-            resolved = self._target_path(current, target)
-            # Every ancestor of the target that is itself a symlink redirects
-            # the walk; follow it so a chain through directories is checked too.
-            hop = self.by_path.get(resolved)
-            if isinstance(hop, SymlinkEntry):
-                current, target = resolved, hop.target
-                continue
-            return
-        raise VolumePathError(
-            f"symlink {link_path!r} forms a chain longer than {MAX_SYMLINK_HOPS} hops"
+                f"symlink {link_path!r} forms a chain longer than {MAX_SYMLINK_HOPS} hops"
+            )
+        real: list[str] = (
+            [] if target.startswith("/") else posixpath.dirname(link_path).split("/")
         )
+        real = [part for part in real if part]
+        for part in target.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not real:
+                    raise VolumePathError(
+                        f"symlink {link_path!r} -> {target!r} escapes the volume root"
+                    )
+                real.pop()
+                continue
+            real.append(part)
+            here = "/".join(real)
+            entry = self.by_path.get(here)
+            # A symlink at any component redirects the rest of the walk, so
+            # the depth that later `..` components pop from is the real one.
+            if isinstance(entry, SymlinkEntry):
+                real = self._real_target(here, entry.target, hops=hops + 1)
+        return real
 
-    def rendered_symlink_target(self, entry: SymlinkEntry) -> str:
-        """The target relative to the link's directory."""
-        link_path = entry.clean_path
-        if not entry.target.startswith("/"):
-            return entry.target
-        resolved = self._target_path(link_path, entry.target)
+    def _render(self, link_path: str, target: str) -> str:
+        if not target.startswith("/"):
+            return target
+        resolved = _normalize(target)
         link_dir = posixpath.dirname(link_path)
-        return posixpath.relpath(resolved, start=link_dir) if link_dir else resolved
+        return posixpath.relpath(resolved or ".", start=link_dir or ".")
 
 
 def hardlink_groups(entries: tuple[PathEntry, ...]) -> dict[int, list[str]]:
@@ -350,14 +358,19 @@ def hardlink_groups(entries: tuple[PathEntry, ...]) -> dict[int, list[str]]:
     groups: dict[int, list[str]] = defaultdict(list)
     for entry in entries:
         if (
-            isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry, SlabmapFileEntry))
+            isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry))
             and entry.link_group is not None
         ):
             groups[entry.link_group].append(entry.clean_path)
     return {group: paths for group, paths in groups.items() if len(paths) > 1}
 
 
-def dump_record(record: BaseModel) -> bytes:
-    """One canonical JSONL line: minified, aliases, no nulls. Used by tests and future push."""
-    payload = record.model_dump(by_alias=True, exclude_none=True, mode="json")
-    return json.dumps(payload, separators=(",", ":"), sort_keys=False).encode() + b"\n"
+def implicit_directories(entries: tuple[PathEntry, ...]) -> list[str]:
+    """Every ancestor directory an entry needs, whether or not the manifest records it."""
+    seen: set[str] = set()
+    for entry in entries:
+        parent = posixpath.dirname(entry.clean_path)
+        while parent and parent not in seen:
+            seen.add(parent)
+            parent = posixpath.dirname(parent)
+    return sorted(seen, key=lambda path: path.count("/"))

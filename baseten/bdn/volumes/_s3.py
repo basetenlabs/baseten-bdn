@@ -10,40 +10,57 @@ import datetime as dt
 import hashlib
 import hmac
 import random
-import threading
+import re
 import time
-from collections.abc import Callable, Mapping
-from urllib.parse import quote, urlsplit
+from collections.abc import Mapping
+from typing import Protocol
+from urllib.parse import quote
 
 import blake3
 import httpx
 
 from baseten.bdn.volumes._cannery import OriginCredentials
 from baseten.bdn.volumes._models import (
-    VolumeAPIError,
     VolumeConnectionError,
     VolumeIntegrityError,
     VolumeProtocolError,
+    VolumeStorageError,
 )
 
 # The stdlib module exists from 3.14; the backport carries the same API below that.
 try:
-    from compression import zstd as _zstd  # ty: ignore[unresolved-import]
+    from compression import zstd  # ty: ignore[unresolved-import]
 except ImportError:
-    from backports import zstd as _zstd  # ty: ignore[unresolved-import]
-
-zstd_decompress = _zstd.decompress
+    try:
+        from backports import zstd  # ty: ignore[unresolved-import]
+    except ImportError as error:
+        raise ImportError(
+            "baseten.bdn.volumes needs zstd support: this Python was built without "
+            "compression.zstd and the backports.zstd package is not installed"
+        ) from error
 
 _UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
 _SIGV4_SAFE = "-_.~"
-_ATTEMPTS = 5
+ATTEMPTS = 5
 _BACKOFF_BASE_SEC = 0.1
 _BACKOFF_CAP_SEC = 2.0
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+# S3 answers these with 400 or 403; both are safe to repeat.
+_RETRYABLE_CODES = frozenset(
+    {"RequestTimeout", "RequestTimeTooSkewed", "SlowDown", "InternalError"}
+)
+_EXPIRED_CODES = frozenset({"ExpiredToken", "ExpiredTokenException", "InvalidToken"})
+_ERROR_CODE = re.compile(rb"<Code>([^<]{1,64})</Code>")
 
 # Content types the origin uses for the objects a pull reads. The suffix is
 # the storage encoding; the kind is checked against what the record expects.
 _CONTENT_TYPE_PREFIX = "application/vnd.baseten.bdn."
+
+
+class CredentialSource(Protocol):
+    def current(self) -> OriginCredentials: ...
+
+    def refresh(self) -> OriginCredentials: ...
 
 
 def sigv4_headers(
@@ -60,12 +77,13 @@ def sigv4_headers(
     Signs every header passed in, so callers add ``Range`` and friends before
     calling. Pure function of its inputs; tests pin it to AWS's published vector.
     """
-    parts = urlsplit(url)
+    parsed = httpx.URL(url)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date = amz_date[:8]
     signed: dict[str, str] = {
         **{key.lower(): value.strip() for key, value in headers.items()},
-        "host": parts.netloc,
+        # httpx drops a default port from the Host it sends; sign what it sends.
+        "host": parsed.netloc.decode("ascii"),
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
@@ -74,13 +92,11 @@ def sigv4_headers(
     names = sorted(signed)
     canonical_headers = "".join(f"{name}:{signed[name]}\n" for name in names)
     signed_headers = ";".join(names)
-    canonical_uri = quote(parts.path or "/", safe="/" + _SIGV4_SAFE)
+    canonical_uri = quote(parsed.path or "/", safe="/" + _SIGV4_SAFE)
     canonical_query = "&".join(
         sorted(
             f"{quote(key, safe=_SIGV4_SAFE)}={quote(value, safe=_SIGV4_SAFE)}"
-            for key, _, value in (
-                pair.partition("=") for pair in parts.query.split("&") if pair
-            )
+            for key, value in parsed.params.multi_items()
         )
     )
     canonical_request = (
@@ -101,7 +117,7 @@ def sigv4_headers(
     return {
         **headers,
         "Authorization": authorization,
-        **{k: v for k, v in signed.items() if k.startswith("x-amz-")},
+        **{name: value for name, value in signed.items() if name.startswith("x-amz-")},
     }
 
 
@@ -125,8 +141,7 @@ def decode_object(
         raise VolumeProtocolError(
             f"object has an unknown Content-Type {content_type!r}"
         )
-    kind_and_encoding = content_type[len(_CONTENT_TYPE_PREFIX) :]
-    kind, _, encoding = kind_and_encoding.partition("+")
+    kind, _, encoding = content_type[len(_CONTENT_TYPE_PREFIX) :].partition("+")
     if kind != f"{expected_kind}.v1":
         raise VolumeProtocolError(
             f"expected a {expected_kind} object, got Content-Type {content_type!r}"
@@ -135,7 +150,7 @@ def decode_object(
         data = body
     elif encoding == "zstd":
         try:
-            data = zstd_decompress(body)
+            data = zstd.decompress(body)
         except Exception as error:
             raise VolumeIntegrityError(
                 f"{expected_kind} object is not valid zstd: {error}"
@@ -155,45 +170,39 @@ def decode_object(
 class ObjectStore:
     """Authenticated GETs against the origin bucket with the credentials cannery issued.
 
-    ``credentials`` is a callable so the owner can hand out fresh STS
-    credentials when the current ones near expiry; a pull can outlive one
-    session.
+    ``credentials`` hands out the current STS credentials and refreshes them
+    when the bucket reports them expired, so a pull can outlive one session.
     """
 
     def __init__(
         self,
         http_client: httpx.Client,
-        credentials: Callable[[], OriginCredentials],
+        credentials: CredentialSource,
         *,
         timeout: httpx.Timeout,
-        clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
-        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._http_client = http_client
         self._credentials = credentials
         self._timeout = timeout
-        self._clock = clock
-        self._sleep = sleep
-        self._lock = threading.Lock()
 
     def get(self, key: str) -> tuple[bytes, str | None]:
         """Return the stored bytes and Content-Type of one object key."""
-        for attempt in range(1, _ATTEMPTS + 1):
-            credentials = self._credentials()
+        credentials = self._credentials.current()
+        for attempt in range(1, ATTEMPTS + 1):
             url = object_url(credentials, key)
             headers = sigv4_headers(
                 method="GET",
                 url=url,
                 headers={},
                 credentials=credentials,
-                now=self._clock(),
+                now=dt.datetime.now(dt.UTC),
             )
             try:
                 response = self._http_client.get(
                     url, headers=headers, timeout=self._timeout
                 )
             except httpx.HTTPError as error:
-                if attempt == _ATTEMPTS or not isinstance(error, httpx.TransportError):
+                if attempt == ATTEMPTS or not isinstance(error, httpx.TransportError):
                     raise VolumeConnectionError(
                         f"could not read {key} from the origin bucket: {error}"
                     ) from error
@@ -202,16 +211,20 @@ class ObjectStore:
                     return _checked_body(response, key), response.headers.get(
                         "content-type"
                     )
-                if (
-                    attempt == _ATTEMPTS
-                    or response.status_code not in _RETRYABLE_STATUSES
+                code = _error_code(response)
+                if code in _EXPIRED_CODES:
+                    credentials = self._credentials.refresh()
+                elif attempt == ATTEMPTS or not (
+                    response.status_code in _RETRYABLE_STATUSES
+                    or code in _RETRYABLE_CODES
                 ):
-                    raise VolumeAPIError(
-                        "origin bucket",
+                    raise VolumeStorageError(
                         response.status_code,
-                        _s3_error_message(response, key),
+                        key,
+                        response.text.strip()[:300],
+                        code=code,
                     )
-            self._sleep(_backoff_sec(attempt))
+            time.sleep(backoff_sec(attempt))
         raise AssertionError("unreachable: the retry loop returns or raises")
 
 
@@ -229,12 +242,16 @@ def _checked_body(response: httpx.Response, key: str) -> bytes:
     return body
 
 
-def _s3_error_message(response: httpx.Response, key: str) -> str:
-    text = response.text.strip()
-    return f"GET {key}: {text[:300]}" if text else f"GET {key}"
+def _error_code(response: httpx.Response) -> str | None:
+    match = _ERROR_CODE.search(response.content)
+    return match.group(1).decode("ascii", "replace") if match else None
 
 
-def _backoff_sec(attempt: int) -> float:
+def is_retryable_status(status_code: int) -> bool:
+    return status_code in _RETRYABLE_STATUSES
+
+
+def backoff_sec(attempt: int) -> float:
     return min(
         _BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * 2 ** (attempt - 1)
     ) * random.uniform(0.5, 1.0)

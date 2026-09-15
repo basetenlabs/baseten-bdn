@@ -15,16 +15,7 @@ from typing import Any
 
 import httpx
 
-from baseten.bdn.volumes import _manifest
-from baseten.bdn.volumes._cannery import ObjectTarget
-from baseten.bdn.volumes._s3 import digest_of
-
-try:
-    from compression import zstd as _zstd  # ty: ignore[unresolved-import]
-except ImportError:
-    from backports import zstd as _zstd  # ty: ignore[unresolved-import]
-
-zstd_compress = _zstd.compress
+from baseten.bdn.volumes._s3 import digest_of, zstd
 
 ORG_ID = "org_2qRk4dB"
 NAMESPACE = "loops"
@@ -38,9 +29,10 @@ API_KEY = "test-api-key"
 CANNERY_TOKEN = "jwt.cannery.token"
 
 CHUNK = "application/vnd.baseten.bdn.chunk.v1"
-CHUNK_ZSTD = CHUNK + "+zstd"
-CHUNKMAP_ZSTD = "application/vnd.baseten.bdn.chunkmap.v1+zstd"
-MANIFEST_ZSTD = "application/vnd.baseten.bdn.manifest.v1+zstd"
+CHUNKMAP = "application/vnd.baseten.bdn.chunkmap.v1"
+MANIFEST = "application/vnd.baseten.bdn.manifest.v1"
+
+EMPTY_DIGEST = digest_of(b"")
 
 
 def relative_key(digest: str) -> str:
@@ -50,6 +42,16 @@ def relative_key(digest: str) -> str:
 
 def full_key(digest: str) -> str:
     return f"bdn/{ORG_ID}/{NAMESPACE}/{relative_key(digest)}"
+
+
+def chunk_record(data: bytes, offset: int = 0) -> dict[str, Any]:
+    digest = digest_of(data)
+    return {
+        "digest": digest,
+        "length": len(data),
+        "offset": offset,
+        "target": {"relative_key": relative_key(digest)},
+    }
 
 
 @dataclass
@@ -78,17 +80,21 @@ class Volume:
 
     objects: dict[str, tuple[bytes, str]] = field(default_factory=dict)
     manifest_digest: str = ""
-    manifest_lines: list[dict[str, Any]] = field(default_factory=list)
 
     def put(self, data: bytes, content_type: str, *, compress: bool) -> str:
         digest = digest_of(data)
-        stored = zstd_compress(data) if compress else data
+        stored = zstd.compress(data) if compress else data
         self.objects[full_key(digest)] = (
             stored,
-            content_type
-            + ("+zstd" if compress and not content_type.endswith("+zstd") else ""),
+            content_type + ("+zstd" if compress else ""),
         )
         return digest
+
+    def put_manifest(self, records: list[dict[str, Any]]) -> None:
+        self.objects = {
+            k: v for k, v in self.objects.items() if k != full_key(self.manifest_digest)
+        }
+        self.manifest_digest = self.put(jsonl(records), MANIFEST, compress=True)
 
 
 def build_volume(tree: dict[str, File | Dir | Symlink]) -> Volume:
@@ -113,42 +119,23 @@ def build_volume(tree: dict[str, File | Dir | Symlink]) -> Volume:
             if spec.link_group is not None:
                 record["link_group"] = spec.link_group
             if spec.chunk_size is None:
+                # Push records even an empty file as one chunk: the empty digest.
+                digest = volume.put(spec.data, CHUNK, compress=spec.compress)
                 record["_kind"] = "chunk"
-                if spec.data:
-                    digest = volume.put(spec.data, CHUNK, compress=spec.compress)
-                    record["chunk"] = {
-                        "digest": digest,
-                        "length": len(spec.data),
-                        "offset": 0,
-                        "target": {"relative_key": relative_key(digest)},
-                    }
+                record["chunk"] = chunk_record(spec.data)
+                assert record["chunk"]["digest"] == digest
             else:
                 chunks = []
                 for offset in range(0, len(spec.data), spec.chunk_size):
                     piece = spec.data[offset : offset + spec.chunk_size]
-                    digest = volume.put(piece, CHUNK, compress=spec.compress)
-                    chunks.append(
-                        {
-                            "_type": "chunk",
-                            "digest": digest,
-                            "length": len(piece),
-                            "offset": offset,
-                            "target": {"relative_key": relative_key(digest)},
-                        }
-                    )
-                chunkmap = jsonl(
-                    [
-                        {
-                            "_type": "chunkmap_header",
-                            "chunk_count": len(chunks),
-                            "file_size": len(spec.data),
-                        },
-                        *chunks,
-                    ]
-                )
-                digest = volume.put(
-                    chunkmap, "application/vnd.baseten.bdn.chunkmap.v1", compress=True
-                )
+                    volume.put(piece, CHUNK, compress=spec.compress)
+                    chunks.append({"_type": "chunk", **chunk_record(piece, offset)})
+                header = {
+                    "_type": "chunkmap_header",
+                    "chunk_count": len(chunks),
+                    "file_size": len(spec.data),
+                }
+                digest = volume.put(jsonl([header, *chunks]), CHUNKMAP, compress=True)
                 record.update(
                     {
                         "_kind": "chunkmap",
@@ -158,30 +145,35 @@ def build_volume(tree: dict[str, File | Dir | Symlink]) -> Volume:
                     }
                 )
             records.append(record)
-    header = {
+    volume.put_manifest([manifest_header(len(records), total), PROVENANCE, *records])
+    return volume
+
+
+def manifest_header(entries: int, total: int = 0) -> dict[str, Any]:
+    return {
         "_type": "manifest_header",
-        "entry_count": len(records),
+        "entry_count": entries,
         "manifest_schema": "v1",
         "total_size": total,
     }
-    provenance = {
-        "_type": "provenance",
-        "source_fingerprint": "x",
-        "source_fingerprint_type": "sha256",
-        "source_uri": "s3://fixture",
-    }
-    volume.manifest_lines = [header, provenance, *records]
-    manifest = jsonl(volume.manifest_lines)
-    volume.manifest_digest = volume.put(
-        manifest, "application/vnd.baseten.bdn.manifest.v1", compress=True
-    )
-    return volume
+
+
+PROVENANCE = {
+    "_type": "provenance",
+    "source_fingerprint": "x",
+    "source_fingerprint_type": "sha256",
+    "source_uri": "s3://fixture",
+}
 
 
 def jsonl(records: list[dict[str, Any]]) -> bytes:
     return b"".join(
         json.dumps(record, separators=(",", ":")).encode() + b"\n" for record in records
     )
+
+
+def s3_error(code: str) -> str:
+    return f"<?xml version='1.0'?><Error><Code>{code}</Code><Message>{code}</Message></Error>"
 
 
 @dataclass
@@ -192,10 +184,13 @@ class FakeServices:
     token_expires_in: dt.timedelta = dt.timedelta(hours=1)
     credentials_expire_in: dt.timedelta | None = dt.timedelta(minutes=30)
     resolve_error: tuple[int, Any] | None = None
+    resolve_failures: list[int] = field(default_factory=list)
+    """Status codes to answer resolve with before answering normally."""
     token_error: tuple[int, Any] | None = None
-    s3_failures: dict[str, list[int]] = field(default_factory=dict)
-    """Per-key list of status codes to answer with before serving the object."""
+    s3_failures: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
+    """Per-key (status, body) answers to give before serving the object."""
     requests: list[httpx.Request] = field(default_factory=list)
+    resolve_count: int = 0
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -225,19 +220,20 @@ class FakeServices:
         )
 
     def _resolve(self, request: httpx.Request) -> httpx.Response:
+        if self.resolve_failures:
+            return httpx.Response(self.resolve_failures.pop(0), text="upstream hiccup")
         if self.resolve_error is not None:
             status, body = self.resolve_error
-            return (
-                httpx.Response(status, json=body)
-                if not isinstance(body, str)
-                else httpx.Response(status, text=body)
-            )
+            if isinstance(body, str):
+                return httpx.Response(status, text=body)
+            return httpx.Response(status, json=body)
+        self.resolve_count += 1
         ref = request.url.params["ref"]
         origin: dict[str, Any] = {
             "endpoint": "",
             "region": REGION,
             "bucket": BUCKET,
-            "access_key_id": "ASIAEXAMPLE",
+            "access_key_id": f"ASIA{self.resolve_count}",
             "secret_access_key": "secret",
             "session_token": "sts-session-token",
         }
@@ -270,10 +266,11 @@ class FakeServices:
         key = request.url.path.lstrip("/")
         pending = self.s3_failures.get(key)
         if pending:
-            return httpx.Response(pending.pop(0), text="<Error>SlowDown</Error>")
+            status, body = pending.pop(0)
+            return httpx.Response(status, text=body)
         stored = self.volume.objects.get(key)
         if stored is None:
-            return httpx.Response(404, text="<Error>NoSuchKey</Error>")
+            return httpx.Response(404, text=s3_error("NoSuchKey"))
         body, content_type = stored
         return httpx.Response(
             200,
@@ -296,10 +293,3 @@ class FakeServices:
 
 def now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
-
-
-def manifest_record(record: _manifest.PathEntry) -> dict[str, Any]:
-    return json.loads(_manifest.dump_record(record))
-
-
-__all__ = ["ObjectTarget"]

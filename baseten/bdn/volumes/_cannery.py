@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -20,6 +20,7 @@ from baseten.bdn.volumes._models import (
     VolumeAPIError,
     VolumeConnectionError,
     VolumeProtocolError,
+    VolumeRefError,
 )
 
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,255}")
@@ -29,13 +30,16 @@ _TAG = re.compile(r"[^\s/:@]+")
 RELATIVE_KEY_PATTERN = r"^objects/b3/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{64}$"
 DIGEST_PATTERN = r"^b3:[0-9a-f]{64}$"
 
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
 
 class VolumeRef(BaseModel):
     """``bdn:<ns>/<vol>`` with an optional ``:tag`` or ``@<digest prefix>`` selector.
 
     Parses both spellings, ``bdn:`` and the legacy ``bdn://``, and renders
     the canonical form cannery produces. ``@`` always means a digest pin, so
-    it is split off before ``:``.
+    it is split off before ``:``. Namespace and volume are case-folded the
+    way every server hop folds them.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -54,35 +58,43 @@ class VolumeRef(BaseModel):
                 rest = rest[len(scheme) :]
                 break
         else:
-            raise ValueError(f"volume ref must start with bdn: or bdn://, got {ref!r}")
+            raise VolumeRefError(
+                f"volume ref must start with bdn: or bdn://, got {ref!r}"
+            )
         pin: str | None = None
         tag: str | None = None
         if "@" in rest:
             rest, raw_pin = rest.split("@", 1)
             raw_pin = raw_pin.removeprefix("b3:").lower()
             if not _HEX_PREFIX.fullmatch(raw_pin):
-                raise ValueError(
+                raise VolumeRefError(
                     f"digest pin must be 12 to 64 hex characters, got {raw_pin!r} in {ref!r}"
                 )
             pin = raw_pin
         elif ":" in rest:
             rest, tag = rest.split(":", 1)
             if not _TAG.fullmatch(tag):
-                raise ValueError(
+                raise VolumeRefError(
                     f"tag must not be empty or contain whitespace, '/', ':' or '@': {ref!r}"
                 )
-        parts = rest.split("/")
+        parts = rest.lower().split("/")
         if len(parts) != 2:
-            raise ValueError(
+            raise VolumeRefError(
                 f"volume ref must be bdn:<namespace>/<volume>, got {ref!r}"
             )
         namespace, volume = parts
         for label, value in (("namespace", namespace), ("volume", volume)):
             if not _IDENTIFIER.fullmatch(value):
-                raise ValueError(
-                    f"{label} must be lowercase letters, digits, '.', '_' or '-': {value!r}"
+                raise VolumeRefError(
+                    f"{label} must be letters, digits, '.', '_' or '-': {value!r}"
                 )
         return cls(namespace=namespace, volume=volume, tag=tag, pin=pin)
+
+    def pinned(self, digest: str) -> VolumeRef:
+        """The same volume pinned to ``digest`` (``b3:<hex>``), so it names one version forever."""
+        return VolumeRef(
+            namespace=self.namespace, volume=self.volume, pin=digest.removeprefix("b3:")
+        )
 
     def canonical(self) -> str:
         selector = f"@{self.pin}" if self.pin else f":{self.tag}" if self.tag else ""
@@ -95,9 +107,6 @@ class ObjectTarget(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     relative_key: str = Field(pattern=RELATIVE_KEY_PATTERN)
-
-    def key(self, org_id: str, namespace: str) -> str:
-        return f"bdn/{org_id}/{namespace}/{self.relative_key}"
 
 
 class ResolvedRef(BaseModel):
@@ -191,7 +200,7 @@ def raise_for_cannery_error(response: httpx.Response) -> None:
     )
 
 
-def parse_json(model: type[Any], response: httpx.Response, what: str) -> Any:
+def parse_json(model: type[_ModelT], response: httpx.Response, what: str) -> _ModelT:
     try:
         return model.model_validate_json(response.content)
     except ValidationError as error:

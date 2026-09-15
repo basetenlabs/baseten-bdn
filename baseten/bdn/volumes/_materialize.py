@@ -1,22 +1,23 @@
-"""Writing a manifest's tree below one destination directory.
+"""Writing a manifest's tree below one destination directory (POSIX only).
 
 Every path is joined below ``root`` after the containment gate has approved
-it. Files are created with ``O_NOFOLLOW`` so a symlink left at the path by an
-earlier pull cannot redirect the write, and modes are applied after the
-bytes, since a mode passed to ``open`` is masked by the umask.
+it. Anything already at a file's path is unlinked before the file is created,
+so a stale symlink cannot redirect the write and a stale hardlink cannot
+share the new bytes with another path. Modes are applied after the bytes,
+since a mode passed to ``open`` is masked by the umask.
 """
 
 from __future__ import annotations
 
-import errno
 import os
-import sys
+import stat
 import threading
 from pathlib import Path
 
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | getattr(os, "O_BINARY", 0)
-_IS_WINDOWS = sys.platform == "win32"
+from baseten.bdn.volumes._models import VolumeDestinationError
+
+_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+_WRITE_FLAGS = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
 
 
 def contained_join(root: Path, entry_path: str) -> Path:
@@ -29,7 +30,9 @@ def ensure_dir(root: Path, entry_path: str) -> Path:
     """Create ``entry_path`` below ``root`` one component at a time.
 
     Component-wise because ``mkdir`` follows a symlink at an intermediate
-    component. A symlink found where a directory belongs is replaced.
+    component. A symlink found where a directory belongs is replaced, and an
+    existing directory left read-only by an earlier pull is made writable
+    again so children can be created; final modes are applied afterwards.
     """
     current = root
     for component in entry_path.lstrip("/").split("/"):
@@ -39,19 +42,36 @@ def ensure_dir(root: Path, entry_path: str) -> Path:
         try:
             os.mkdir(current)
         except FileExistsError:
-            if current.is_symlink():
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode):
                 os.unlink(current)
                 os.mkdir(current)
-            elif not current.is_dir():
-                raise NotADirectoryError(
-                    errno.ENOTDIR, f"{current} exists and is not a directory"
-                )
+            elif not stat.S_ISDIR(info.st_mode):
+                raise VolumeDestinationError(
+                    f"{current} exists and is not a directory"
+                ) from None
+            elif info.st_mode & 0o300 != 0o300:
+                os.chmod(current, stat.S_IMODE(info.st_mode) | 0o300)
     return current
 
 
+def remove_if_present(path: Path) -> None:
+    """Unlink a file or symlink at ``path``; a directory there is an error."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode):
+        raise VolumeDestinationError(
+            f"{path} is a directory but the volume has a file there"
+        )
+    os.unlink(path)
+
+
 def create_file(path: Path, size: int) -> None:
-    """Create or truncate ``path`` and preallocate ``size`` bytes."""
-    fd = _open_nofollow(path, _WRITE_FLAGS | os.O_TRUNC)
+    """Create ``path`` fresh and preallocate ``size`` bytes."""
+    remove_if_present(path)
+    fd = os.open(path, _CREATE_FLAGS, 0o600)
     try:
         if size:
             os.ftruncate(fd, size)
@@ -61,70 +81,37 @@ def create_file(path: Path, size: int) -> None:
 
 def write_at(path: Path, offset: int, data: bytes) -> None:
     """Write ``data`` at ``offset`` into an already created file."""
-    fd = _open_nofollow(path, _WRITE_FLAGS)
+    fd = os.open(path, _WRITE_FLAGS)
     try:
-        if _IS_WINDOWS:
-            os.lseek(fd, offset, os.SEEK_SET)
-            _write_all(fd, data)
-        else:
-            written = 0
-            while written < len(data):
-                written += os.pwrite(fd, data[written:], offset + written)
+        view = memoryview(data)
+        while view:
+            written = os.pwrite(fd, view, offset)
+            view = view[written:]
+            offset += written
     finally:
         os.close(fd)
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view) :]
-
-
-def _open_nofollow(path: Path, flags: int) -> int:
-    try:
-        return os.open(path, flags, 0o600)
-    except OSError as error:
-        # ELOOP: a symlink sits at the final component. Replace it with a file.
-        if error.errno != errno.ELOOP:
-            raise
-        os.unlink(path)
-        return os.open(path, flags, 0o600)
-
-
 def create_symlink(path: Path, target: str) -> None:
-    if _IS_WINDOWS:
-        raise NotImplementedError(
-            "pulling a volume with symlinks is not supported on Windows"
-        )
-    if path.is_symlink() or path.is_file():
-        os.unlink(path)
+    remove_if_present(path)
     os.symlink(target, path)
 
 
 def create_hardlink(path: Path, source: Path) -> None:
-    if _IS_WINDOWS:
-        raise NotImplementedError(
-            "pulling a volume with hardlinks is not supported on Windows"
-        )
-    if path.is_symlink() or path.exists():
-        os.unlink(path)
+    remove_if_present(path)
     os.link(source, path)
 
 
 def apply_mode(path: Path, mode: int) -> None:
-    if _IS_WINDOWS:
-        return
-    os.chmod(
-        path, mode, follow_symlinks=False
-    ) if os.chmod in os.supports_follow_symlinks else os.chmod(path, mode)
+    os.chmod(path, mode)
 
 
 class ByteBudget:
     """Bounds bytes held in memory across worker threads.
 
-    A caller acquires the decompressed size it is about to buffer and
-    releases it after writing. Requests larger than the budget are allowed
-    through alone rather than deadlocking.
+    A caller acquires what it is about to buffer and releases it after
+    writing. Requests larger than the budget are allowed through alone rather
+    than deadlocking.
     """
 
     def __init__(self, limit: int) -> None:
