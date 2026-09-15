@@ -31,6 +31,26 @@ load_adapter(adapter.path)  # /bdn/mounts/sql-lora
 to the pod and stay mounted after the client is closed; call `detach` to free a
 target name for reuse.
 
+## Volumes
+
+From any machine with a Baseten API key, `baseten.bdn.volumes` resolves a
+volume ref, lists its files, or pulls a version into a local directory. The
+client mints a short-lived token through the Baseten API, resolves the ref,
+and reads the volume's objects directly from storage with the credentials it
+is given, verifying every object against its recorded digest.
+
+```python
+from baseten.bdn.volumes import VolumesClient
+
+with VolumesClient(api_key="...") as volumes:
+    result = volumes.pull("bdn:loops/sampler-abc123:step-100", "./checkpoint")
+
+print(result.files, result.bytes)
+```
+
+Refs are `bdn:<namespace>/<volume>` with an optional `:<tag>` or `@<digest>`.
+A pull writes in place and overwrites an existing tree entry by entry.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/).

@@ -1,0 +1,240 @@
+"""Reads from the origin bucket: SigV4 signing, decode by content type, digest checks.
+
+Every object is stored raw or zstd-compressed, declared by its Content-Type
+and never by its key, and every digest is BLAKE3 over the decompressed bytes.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import hmac
+import random
+import threading
+import time
+from collections.abc import Callable, Mapping
+from urllib.parse import quote, urlsplit
+
+import blake3
+import httpx
+
+from baseten.bdn.volumes._cannery import OriginCredentials
+from baseten.bdn.volumes._models import (
+    VolumeAPIError,
+    VolumeConnectionError,
+    VolumeIntegrityError,
+    VolumeProtocolError,
+)
+
+# The stdlib module exists from 3.14; the backport carries the same API below that.
+try:
+    from compression import zstd as _zstd  # ty: ignore[unresolved-import]
+except ImportError:
+    from backports import zstd as _zstd  # ty: ignore[unresolved-import]
+
+zstd_decompress = _zstd.decompress
+
+_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+_SIGV4_SAFE = "-_.~"
+_ATTEMPTS = 5
+_BACKOFF_BASE_SEC = 0.1
+_BACKOFF_CAP_SEC = 2.0
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Content types the origin uses for the objects a pull reads. The suffix is
+# the storage encoding; the kind is checked against what the record expects.
+_CONTENT_TYPE_PREFIX = "application/vnd.baseten.bdn."
+
+
+def sigv4_headers(
+    *,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    credentials: OriginCredentials,
+    now: dt.datetime,
+    payload_hash: str = _UNSIGNED_PAYLOAD,
+) -> dict[str, str]:
+    """Return ``headers`` plus the SigV4 ``Authorization`` and ``x-amz-*`` headers.
+
+    Signs every header passed in, so callers add ``Range`` and friends before
+    calling. Pure function of its inputs; tests pin it to AWS's published vector.
+    """
+    parts = urlsplit(url)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date = amz_date[:8]
+    signed: dict[str, str] = {
+        **{key.lower(): value.strip() for key, value in headers.items()},
+        "host": parts.netloc,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    if credentials.session_token:
+        signed["x-amz-security-token"] = credentials.session_token
+    names = sorted(signed)
+    canonical_headers = "".join(f"{name}:{signed[name]}\n" for name in names)
+    signed_headers = ";".join(names)
+    canonical_uri = quote(parts.path or "/", safe="/" + _SIGV4_SAFE)
+    canonical_query = "&".join(
+        sorted(
+            f"{quote(key, safe=_SIGV4_SAFE)}={quote(value, safe=_SIGV4_SAFE)}"
+            for key, _, value in (
+                pair.partition("=") for pair in parts.query.split("&") if pair
+            )
+        )
+    )
+    canonical_request = (
+        f"{method}\n{canonical_uri}\n{canonical_query}\n"
+        f"{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    scope = f"{date}/{credentials.region}/s3/aws4_request"
+    request_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{request_hash}"
+    key = f"AWS4{credentials.secret_access_key}".encode()
+    for message in (date, credentials.region, "s3", "aws4_request"):
+        key = hmac.new(key, message.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={credentials.access_key_id}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        **headers,
+        "Authorization": authorization,
+        **{k: v for k, v in signed.items() if k.startswith("x-amz-")},
+    }
+
+
+def object_url(credentials: OriginCredentials, key: str) -> str:
+    """Virtual-hosted with Transfer Acceleration on AWS; path-style elsewhere."""
+    encoded_key = quote(key, safe="/" + _SIGV4_SAFE)
+    if not credentials.endpoint:
+        return f"https://{credentials.bucket}.s3-accelerate.amazonaws.com/{encoded_key}"
+    return f"{credentials.endpoint.rstrip('/')}/{credentials.bucket}/{encoded_key}"
+
+
+def digest_of(data: bytes) -> str:
+    return "b3:" + blake3.blake3(data).hexdigest()
+
+
+def decode_object(
+    body: bytes, content_type: str | None, *, expected_kind: str, expected_digest: str
+) -> bytes:
+    """Decompress per Content-Type and verify the BLAKE3 digest of the result."""
+    if not content_type or not content_type.startswith(_CONTENT_TYPE_PREFIX):
+        raise VolumeProtocolError(
+            f"object has an unknown Content-Type {content_type!r}"
+        )
+    kind_and_encoding = content_type[len(_CONTENT_TYPE_PREFIX) :]
+    kind, _, encoding = kind_and_encoding.partition("+")
+    if kind != f"{expected_kind}.v1":
+        raise VolumeProtocolError(
+            f"expected a {expected_kind} object, got Content-Type {content_type!r}"
+        )
+    if encoding == "":
+        data = body
+    elif encoding == "zstd":
+        try:
+            data = zstd_decompress(body)
+        except Exception as error:
+            raise VolumeIntegrityError(
+                f"{expected_kind} object is not valid zstd: {error}"
+            ) from error
+    else:
+        raise VolumeProtocolError(
+            f"object has an unknown encoding in Content-Type {content_type!r}"
+        )
+    actual = digest_of(data)
+    if actual != expected_digest:
+        raise VolumeIntegrityError(
+            f"{expected_kind} object digest {actual} does not match the recorded {expected_digest}"
+        )
+    return data
+
+
+class ObjectStore:
+    """Authenticated GETs against the origin bucket with the credentials cannery issued.
+
+    ``credentials`` is a callable so the owner can hand out fresh STS
+    credentials when the current ones near expiry; a pull can outlive one
+    session.
+    """
+
+    def __init__(
+        self,
+        http_client: httpx.Client,
+        credentials: Callable[[], OriginCredentials],
+        *,
+        timeout: httpx.Timeout,
+        clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._http_client = http_client
+        self._credentials = credentials
+        self._timeout = timeout
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> tuple[bytes, str | None]:
+        """Return the stored bytes and Content-Type of one object key."""
+        for attempt in range(1, _ATTEMPTS + 1):
+            credentials = self._credentials()
+            url = object_url(credentials, key)
+            headers = sigv4_headers(
+                method="GET",
+                url=url,
+                headers={},
+                credentials=credentials,
+                now=self._clock(),
+            )
+            try:
+                response = self._http_client.get(
+                    url, headers=headers, timeout=self._timeout
+                )
+            except httpx.HTTPError as error:
+                if attempt == _ATTEMPTS or not isinstance(error, httpx.TransportError):
+                    raise VolumeConnectionError(
+                        f"could not read {key} from the origin bucket: {error}"
+                    ) from error
+            else:
+                if response.is_success:
+                    return _checked_body(response, key), response.headers.get(
+                        "content-type"
+                    )
+                if (
+                    attempt == _ATTEMPTS
+                    or response.status_code not in _RETRYABLE_STATUSES
+                ):
+                    raise VolumeAPIError(
+                        "origin bucket",
+                        response.status_code,
+                        _s3_error_message(response, key),
+                    )
+            self._sleep(_backoff_sec(attempt))
+        raise AssertionError("unreachable: the retry loop returns or raises")
+
+
+def _checked_body(response: httpx.Response, key: str) -> bytes:
+    body = response.content
+    declared = response.headers.get("content-length")
+    if declared is None:
+        raise VolumeProtocolError(
+            f"origin bucket answered for {key} without Content-Length"
+        )
+    if int(declared) != len(body):
+        raise VolumeIntegrityError(
+            f"origin bucket sent {len(body)} bytes for {key}, Content-Length said {declared}"
+        )
+    return body
+
+
+def _s3_error_message(response: httpx.Response, key: str) -> str:
+    text = response.text.strip()
+    return f"GET {key}: {text[:300]}" if text else f"GET {key}"
+
+
+def _backoff_sec(attempt: int) -> float:
+    return min(
+        _BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * 2 ** (attempt - 1)
+    ) * random.uniform(0.5, 1.0)
