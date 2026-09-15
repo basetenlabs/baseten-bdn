@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import threading
 from pathlib import Path
 
-from baseten.bdn.volumes._models import VolumeDestinationError
+from baseten.bdn.volumes._models import VolumeDestinationError, VolumeUnsupportedError
 
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -81,6 +82,10 @@ def create_file(path: Path, size: int) -> None:
 
 def write_at(path: Path, offset: int, data: bytes) -> None:
     """Write ``data`` at ``offset`` into an already created file."""
+    if sys.platform == "win32":
+        raise VolumeUnsupportedError(
+            "pulling volumes is supported on Linux and macOS only"
+        )
     fd = os.open(path, _WRITE_FLAGS)
     try:
         view = memoryview(data)
