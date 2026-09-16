@@ -95,11 +95,21 @@ wheels = [
 ]
 
 [[package]]
+name = "baseten"
+version = "0.10.0"
+source = { git = "https://github.com/basetenlabs/baseten-python?rev=main#d3d9c8c3b2e6a96d27b92b9555105c04e7bbe5f3" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "baseten-bdn"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'" },
+    { name = "baseten" },
     { name = "blake3" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -117,6 +127,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'", specifier = ">=1.7.0" },
+    { name = "baseten", git = "https://github.com/basetenlabs/baseten-python?rev=main" },
     { name = "blake3", specifier = ">=1.0.9" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.0" },

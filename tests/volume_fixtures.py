@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from baseten.client import ManagementClient
 
+from baseten.bdn.volumes import VolumeClient
 from baseten.bdn.volumes._s3 import digest_of, zstd
 
 ORG_ID = "org_2qRk4dB"
@@ -33,6 +35,8 @@ CHUNKMAP = "application/vnd.baseten.bdn.chunkmap.v1"
 MANIFEST = "application/vnd.baseten.bdn.manifest.v1"
 
 EMPTY_DIGEST = digest_of(b"")
+MTIME = "2026-09-15T12:34:56.123456789Z"
+MTIME_NS = 1789475696_123456789
 
 
 def relative_key(digest: str) -> str:
@@ -62,11 +66,13 @@ class File:
     """Split into a chunkmap with chunks of this size; ``None`` stores one chunk."""
     link_group: int | None = None
     compress: bool = False
+    mtime: str | None = None
 
 
 @dataclass
 class Dir:
     mode: str = "0755"
+    mtime: str | None = None
 
 
 @dataclass
@@ -103,7 +109,14 @@ def build_volume(tree: dict[str, File | Dir | Symlink]) -> Volume:
     total = 0
     for path, spec in tree.items():
         if isinstance(spec, Dir):
-            records.append({"_type": "directory", "mode": spec.mode, "path": path})
+            record: dict[str, Any] = {
+                "_type": "directory",
+                "mode": spec.mode,
+                "path": path,
+            }
+            if spec.mtime:
+                record["mtime"] = spec.mtime
+            records.append(record)
         elif isinstance(spec, Symlink):
             records.append(
                 {
@@ -115,15 +128,16 @@ def build_volume(tree: dict[str, File | Dir | Symlink]) -> Volume:
             )
         else:
             total += len(spec.data)
-            record: dict[str, Any] = {"_type": "file", "mode": spec.mode, "path": path}
+            record = {"_type": "file", "mode": spec.mode, "path": path}
+            if spec.mtime:
+                record["mtime"] = spec.mtime
             if spec.link_group is not None:
                 record["link_group"] = spec.link_group
             if spec.chunk_size is None:
                 # Push records even an empty file as one chunk: the empty digest.
-                digest = volume.put(spec.data, CHUNK, compress=spec.compress)
+                volume.put(spec.data, CHUNK, compress=spec.compress)
                 record["_kind"] = "chunk"
                 record["chunk"] = chunk_record(spec.data)
-                assert record["chunk"]["digest"] == digest
             else:
                 chunks = []
                 for offset in range(0, len(spec.data), spec.chunk_size):
@@ -187,6 +201,8 @@ class FakeServices:
     resolve_failures: list[int] = field(default_factory=list)
     """Status codes to answer resolve with before answering normally."""
     token_error: tuple[int, Any] | None = None
+    token_failures: list[int] = field(default_factory=list)
+    bdn_endpoint: str | None = f"https://{BDN_HOST}"
     s3_failures: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
     """Per-key (status, body) answers to give before serving the object."""
     requests: list[httpx.Request] = field(default_factory=list)
@@ -204,6 +220,8 @@ class FakeServices:
         return httpx.Response(500, text=f"unexpected host {host}")
 
     def _token(self, request: httpx.Request) -> httpx.Response:
+        if self.token_failures:
+            return httpx.Response(self.token_failures.pop(0), text="upstream hiccup")
         if self.token_error is not None:
             status, body = self.token_error
             return httpx.Response(status, json=body)
@@ -215,7 +233,7 @@ class FakeServices:
                 "scopes": ["PULL"],
                 "namespaces": [NAMESPACE],
                 "volumes": [VOLUME],
-                "bdn_endpoint": f"https://{BDN_HOST}",
+                "bdn_endpoint": self.bdn_endpoint,
             },
         )
 
@@ -280,6 +298,29 @@ class FakeServices:
 
     def http_client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.handle))
+
+    def management_client(self) -> ManagementClient:
+        # The generated client posts relative paths, so its own httpx client
+        # carries the base URL and the bearer header, as ManagementClient
+        # would set them for a client it builds itself.
+        return ManagementClient(
+            api_key=API_KEY,
+            base_url_override=f"https://{API_HOST}",
+            http_client_override=httpx.Client(
+                transport=httpx.MockTransport(self.handle),
+                base_url=f"https://{API_HOST}",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+            ),
+        )
+
+    def client(self, **kwargs: Any) -> VolumeClient:
+        return VolumeClient(
+            api_key=API_KEY,
+            base_url_override=f"https://{API_HOST}",
+            http_client_override=self.http_client(),
+            management_client_override=self.management_client(),
+            **kwargs,
+        )
 
     def s3_requests(self) -> list[httpx.Request]:
         return [request for request in self.requests if request.url.host == S3_HOST]

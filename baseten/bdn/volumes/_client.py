@@ -1,9 +1,9 @@
-"""Client-side reads of BDN volumes: resolve, list, and pull to a directory.
+"""Client-side reads of BDN volumes: resolve, fetch a manifest, pull to a directory.
 
 The read path touches three services:
 
 1. The Baseten API mints a one-hour cannery token scoped to one volume
-   (``POST /v1/volumes/token``), authenticated with the caller's API key.
+   (``POST /v1/volumes/token``), through baseten-python's ``ManagementClient``.
 2. Cannery resolves the ref to a manifest digest and returns short-lived
    credentials for the origin bucket (``POST /v1/volumes/resolve``).
 3. The origin bucket serves the manifest, chunkmaps, and chunks, read
@@ -19,22 +19,24 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Self, TypeVar
 
 import httpx
+from baseten.client import ManagementClient
+from baseten.client.managementapi import (
+    CreateVolumeTokenRequest,
+    CreateVolumeTokenResponse,
+    ResponseError,
+    VolumeTokenScope,
+)
 
 from baseten.bdn._useragent import user_agent
 from baseten.bdn.volumes import _cannery, _manifest, _materialize, _s3
-from baseten.bdn.volumes._cannery import (
-    OriginCredentials,
-    ResolveResponse,
-    TokenResponse,
-    VolumeRef,
-)
+from baseten.bdn.volumes._cannery import OriginCredentials, ResolveResponse
 from baseten.bdn.volumes._manifest import (
     ChunkEntry,
     ChunkFileEntry,
@@ -45,23 +47,24 @@ from baseten.bdn.volumes._manifest import (
     SymlinkEntry,
 )
 from baseten.bdn.volumes._models import (
-    FileInfo,
     PullResult,
-    ResolvedVolume,
+    VolumeAPIError,
     VolumeConnectionError,
     VolumeDestinationError,
     VolumeIntegrityError,
+    VolumeManifest,
+    VolumeRefError,
     VolumeUnsupportedError,
 )
+from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
-DEFAULT_BASE_URL = "https://api.baseten.co"
 DEFAULT_MAX_CONCURRENCY = 16
 DEFAULT_MAX_BYTES_IN_FLIGHT = 1 << 30
 DEFAULT_REQUEST_TIMEOUT_SEC = 60.0
 
-_TOKEN_PATH = "/v1/volumes/token"
 _RESOLVE_PATH = "/v1/volumes/resolve"
 # Tokens and STS sessions are re-minted this long before they expire, so an
 # in-flight request never presents a credential that lapses mid-request.
@@ -70,12 +73,12 @@ _CONNECT_TIMEOUT_SEC = 10.0
 
 
 @dataclass(frozen=True)
-class VolumesClientOptions:
-    """Options for :class:`VolumesClient`."""
+class VolumeClientOptions:
+    """Options for :class:`VolumeClient`."""
 
     api_key: str
     base_url_override: str | None = None
-    """Baseten API base URL; ``None`` means ``https://api.baseten.co``."""
+    """Baseten API base URL; ``None`` means the public API."""
 
     bdn_endpoint_override: str | None = None
     """Cannery base URL; ``None`` uses the one the token response names."""
@@ -87,7 +90,7 @@ class VolumesClientOptions:
     """Bound on chunk bytes buffered in memory during a pull, compressed and decoded copies included."""
 
     request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC
-    """Read bound on one HTTP request to any of the three services."""
+    """Read bound on one HTTP request to cannery or the origin bucket."""
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -102,13 +105,13 @@ class VolumesClientOptions:
     @property
     def base_url(self) -> str:
         """The Baseten API base URL in effect."""
-        return self.base_url_override or DEFAULT_BASE_URL
+        return self.base_url_override or ManagementClient.default_base_url()
 
 
-class VolumesClient:
+class VolumeClient:
     """Synchronous client for reading BDN volumes from anywhere with a Baseten API key.
 
-    Usable as a context manager; exiting closes the HTTP client.
+    Usable as a context manager; exiting closes the HTTP clients this object owns.
     """
 
     def __init__(
@@ -121,26 +124,30 @@ class VolumesClient:
         max_bytes_in_flight: int = DEFAULT_MAX_BYTES_IN_FLIGHT,
         request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
         http_client_override: httpx.Client | None = None,
+        management_client_override: ManagementClient | None = None,
         close_http_client_on_close: bool | None = None,
     ) -> None:
-        """Create a volumes client.
+        """Create a volume client.
 
         Args:
-            api_key: Baseten API key; used only against the Baseten API to
-                mint cannery tokens.
+            api_key: Baseten API key; used only to mint cannery tokens.
             base_url_override: Baseten API base URL.
             bdn_endpoint_override: Cannery base URL, when not the one the
                 token response names.
             max_concurrency: In-flight object reads during a pull.
             max_bytes_in_flight: Bound on chunk bytes buffered in memory.
-            request_timeout_sec: Read bound on one HTTP request.
-            http_client_override: Pre-configured httpx client used for all
-                three services; the caller owns its transport.
-            close_http_client_on_close: Whether :meth:`close` closes the HTTP
-                client. Defaults to ``True`` for a client created here and
-                ``False`` for *http_client_override*.
+            request_timeout_sec: Read bound on one HTTP request to cannery
+                or the origin bucket.
+            http_client_override: Pre-configured httpx client for cannery and
+                the origin bucket; the caller owns its transport.
+            management_client_override: Pre-configured baseten-python
+                :class:`ManagementClient` for the token mint; the caller owns
+                its lifetime.
+            close_http_client_on_close: Whether :meth:`close` closes the
+                clients. Defaults to ``True`` for clients created here and
+                ``False`` for overrides.
         """
-        self._options = VolumesClientOptions(
+        self._options = VolumeClientOptions(
             api_key=api_key,
             base_url_override=base_url_override,
             bdn_endpoint_override=bdn_endpoint_override,
@@ -149,60 +156,102 @@ class VolumesClient:
             request_timeout_sec=request_timeout_sec,
         )
         self._timeout = httpx.Timeout(request_timeout_sec, connect=_CONNECT_TIMEOUT_SEC)
+        self._owns_http_client = http_client_override is None
         self._http_client = (
             httpx.Client(timeout=self._timeout, headers={"User-Agent": user_agent()})
             if http_client_override is None
             else http_client_override
         )
+        self._owns_management_client = management_client_override is None
+        self._management_client = (
+            ManagementClient(api_key=api_key, base_url_override=base_url_override)
+            if management_client_override is None
+            else management_client_override
+        )
         self.close_http_client_on_close = (
-            http_client_override is None
+            (self._owns_http_client and self._owns_management_client)
             if close_http_client_on_close is None
             else close_http_client_on_close
         )
-        self._tokens: dict[tuple[str, str], TokenResponse] = {}
+        self._tokens: dict[tuple[str, str], CreateVolumeTokenResponse] = {}
         self._tokens_lock = threading.Lock()
 
     @property
-    def options(self) -> VolumesClientOptions:
+    def options(self) -> VolumeClientOptions:
         """The options this client was constructed with."""
         return self._options
 
     @property
     def http_client(self) -> httpx.Client:
-        """The underlying httpx client."""
+        """The httpx client used for cannery and the origin bucket."""
         return self._http_client
 
-    def resolve(self, ref: str) -> ResolvedVolume:
-        """Resolve a ref to the version it names, without downloading anything.
+    @property
+    def management_client(self) -> ManagementClient:
+        """The baseten-python client used to mint volume tokens."""
+        return self._management_client
 
-        Args:
-            ref: ``bdn:<namespace>/<volume>`` optionally with ``:<tag>`` or
-                ``@<digest prefix>`` (12 to 64 hex characters). A bare ref
-                resolves to the volume's head.
+    def resolve(self, ref: str | VolumeRef) -> VolumeRef:
+        """Resolve a ref to the version it names, returned as a digest-pinned ref.
+
+        A bare volume resolves to its head; a tag or a digest prefix to that
+        point. A path on the ref is ignored. Pull the returned ref to get
+        exactly this version again.
         """
-        return _public_resolved(self._resolve(VolumeRef.parse(ref)))
+        parsed = _volume_or_point(ref)
+        return parsed.pinned(self._resolve(parsed).resolved.origin_digest)
 
-    def list_files(self, ref: str) -> list[FileInfo]:
-        """List the entries of the version ``ref`` names. Downloads only the manifest."""
-        parsed = VolumeRef.parse(ref)
+    def fetch_manifest(self, ref: str | VolumeRef) -> VolumeManifest:
+        """Read the manifest of the version ``ref`` names, without downloading content.
+
+        A path on the ref narrows ``entries`` to that path and what is under
+        it; ``entry_count`` and ``total_size`` still describe the whole version.
+        """
+        parsed = _volume_or_point(ref)
         resolution = self._resolve(parsed)
         store = self._object_store(parsed, resolution)
-        return self._fetch_manifest(store, parsed, resolution).file_infos()
+        manifest = self._fetch_manifest(store, parsed, resolution)
+        paths = (
+            _manifest.select_paths(manifest.entries, _ref_include(parsed))
+            if parsed.path
+            else None
+        )
+        return VolumeManifest(
+            version_ref=parsed.pinned(resolution.resolved.origin_digest),
+            entry_count=len(manifest.entries),
+            total_size=manifest.header.total_size,
+            entries=manifest.public_entries(paths),
+        )
 
-    def pull(self, ref: str, dest_dir: str | Path) -> PullResult:
+    def pull(
+        self,
+        ref: str | VolumeRef,
+        dest_dir: str | Path,
+        *,
+        overwrite: bool = False,
+        include: Sequence[str] = (),
+    ) -> PullResult:
         """Materialize the version ``ref`` names at ``dest_dir``.
 
-        When ``dest_dir`` does not exist yet, the tree is built in a sibling
-        staging directory and renamed into place at the end, so a failed pull
-        leaves nothing behind. When it exists, entries are written into it in
-        place and a failure leaves what was written so far. Every object is
-        verified against its recorded BLAKE3 digest before it is written.
+        Unless ``overwrite`` is set, ``dest_dir`` must not exist or must be
+        empty; the tree is assembled beside it and moved into place only once
+        complete, so a failed pull leaves nothing behind. With ``overwrite``
+        the tree is written into ``dest_dir`` in place, entry by entry, and a
+        failure leaves what was written so far. Every object is verified
+        against its recorded BLAKE3 digest before it is written.
+
+        A path on ``ref`` and any ``include`` entries narrow the pull to those
+        paths and what is under them, matched on slash boundaries relative to
+        the volume root. Narrowing does not move anything: an entry lands at
+        its own path below ``dest_dir``. An include that matches nothing is an
+        error rather than a smaller pull.
 
         Raises:
             VolumePathError: The manifest would place an entry outside
-                ``dest_dir``; nothing is written.
-            VolumeDestinationError: ``dest_dir`` cannot take the volume: too
-                little free space, or a file where a directory is needed.
+                ``dest_dir``, or an include names nothing; nothing is written.
+            VolumeDestinationError: ``dest_dir`` exists and is not empty
+                without ``overwrite``, has too little free space, or has a
+                file where a directory is needed.
             VolumeIntegrityError: A downloaded object failed its digest or
                 length check.
             VolumeAPIError: The Baseten API or cannery rejected a request.
@@ -215,30 +264,37 @@ class VolumesClient:
                 "pulling volumes is supported on Linux and macOS only"
             )
         started = time.perf_counter()
-        parsed = VolumeRef.parse(ref)
+        parsed = _volume_or_point(ref)
         dest = Path(dest_dir)
+        _check_destination(dest, overwrite)
         resolution = self._resolve(parsed)
+        version_ref = parsed.pinned(resolution.resolved.origin_digest)
         store = self._object_store(parsed, resolution)
         manifest = self._fetch_manifest(store, parsed, resolution)
         contained = _manifest.ContainedPaths(manifest.entries)
+        selected = _manifest.select_paths(
+            manifest.entries, [*_ref_include(parsed), *include]
+        )
         _check_free_space(dest, manifest.header.total_size)
         logger.info(
             "pull %s: %d entries, %d bytes -> %s",
-            resolution.resolved.reference,
+            version_ref,
             len(manifest.entries),
             manifest.header.total_size,
             dest,
         )
 
-        staging = None if dest.exists() else _staging_dir(dest)
+        staging = None if overwrite else _staging_dir(dest)
         root = staging or dest
         try:
             root.mkdir(parents=True, exist_ok=True)
             materializer = _Materializer(
                 store, parsed, resolution, root, contained, self._options
             )
-            written, file_count = materializer.run(manifest)
+            written, file_count = materializer.run(manifest, selected)
             if staging is not None:
+                if dest.exists():
+                    dest.rmdir()
                 staging.rename(dest)
         except BaseException:
             if staging is not None:
@@ -246,27 +302,30 @@ class VolumesClient:
             raise
 
         duration = time.perf_counter() - started
+        total_files = len(manifest.files())
         logger.info(
             "pull %s done: %d files, %d bytes in %.1fs -> %s",
-            resolution.resolved.reference,
+            version_ref,
             file_count,
             written,
             duration,
             dest,
         )
         return PullResult(
-            reference=resolution.resolved.reference,
-            digest=resolution.resolved.origin_digest,
+            version_ref=version_ref,
             dest_dir=dest,
             file_count=file_count,
             bytes_written=written,
+            selected_file_count=file_count,
+            total_file_count=total_files,
             duration_sec=duration,
         )
 
     def close(self) -> None:
-        """Close the HTTP client if this object owns it."""
+        """Close the HTTP clients this object owns."""
         if self.close_http_client_on_close:
             self._http_client.close()
+            self._management_client.close()
 
     def __enter__(self) -> Self:
         return self
@@ -274,24 +333,25 @@ class VolumesClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def _token(self, ref: VolumeRef) -> TokenResponse:
+    def _token(self, ref: VolumeRef) -> CreateVolumeTokenResponse:
         key = (ref.namespace, ref.volume)
         with self._tokens_lock:
             cached = self._tokens.get(key)
             if cached is not None and cached.expires_at - _now() > _EXPIRY_MARGIN:
                 return cached
-            response = self._post_with_retry(
-                "the Baseten API",
-                f"{self._options.base_url}{_TOKEN_PATH}",
-                json=_cannery.token_request(ref),
-                headers={"Authorization": f"Bearer {self._options.api_key}"},
+            request = CreateVolumeTokenRequest(
+                scopes=[VolumeTokenScope.PULL],
+                namespaces=[ref.namespace],
+                volumes=[ref.volume],
             )
-            _cannery.raise_for_baseten_error(response)
-            token = _cannery.parse_json(TokenResponse, response, "volume token")
+            token = self._with_retry(
+                "Baseten API",
+                lambda: self._management_client.api.post_volumes_token(request=request),
+            )
             self._tokens[key] = token
             return token
 
-    def _bdn_endpoint(self, token: TokenResponse) -> str:
+    def _bdn_endpoint(self, token: CreateVolumeTokenResponse) -> str:
         endpoint = self._options.bdn_endpoint_override or token.bdn_endpoint
         if not endpoint:
             raise VolumeConnectionError(
@@ -301,45 +361,48 @@ class VolumesClient:
 
     def _resolve(self, ref: VolumeRef) -> ResolveResponse:
         token = self._token(ref)
-        response = self._post_with_retry(
-            "cannery",
-            f"{self._bdn_endpoint(token)}{_RESOLVE_PATH}",
-            params={"ref": ref.canonical()},
-            headers={"Authorization": f"Bearer {token.token}"},
-        )
+
+        def post() -> httpx.Response:
+            response = self._http_client.post(
+                f"{self._bdn_endpoint(token)}{_RESOLVE_PATH}",
+                params={"ref": str(ref.without_path())},
+                headers={"Authorization": f"Bearer {token.token}"},
+                timeout=self._timeout,
+            )
+            # Surface a retryable status the same way the generated client does.
+            if _s3.is_retryable_status(response.status_code):
+                raise ResponseError(
+                    status_code=response.status_code, body=response.text
+                )
+            return response
+
+        try:
+            response = self._with_retry("cannery", post)
+        except VolumeAPIError as error:
+            # The last attempt's retryable status; report it through the
+            # cannery envelope translation like any other rejection.
+            raise VolumeAPIError("cannery", error.status_code, error.message) from None
         _cannery.raise_for_cannery_error(response)
         return _cannery.parse_json(ResolveResponse, response, "resolve")
 
-    def _post_with_retry(
-        self,
-        service: str,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        json: Mapping[str, Any] | None = None,
-        params: Mapping[str, str] | None = None,
-    ) -> httpx.Response:
-        # Both POSTs are safe to repeat: a token mint and a resolve change no
-        # state beyond issuing another short-lived credential.
+    def _with_retry(self, service: str, call: Callable[[], _T]) -> _T:
+        # Token mint and resolve are safe to repeat: neither changes state
+        # beyond issuing another short-lived credential.
         for attempt in range(1, _s3.ATTEMPTS + 1):
             try:
-                response = self._http_client.post(
-                    url,
-                    json=json,
-                    params=params,
-                    headers=headers,
-                    timeout=self._timeout,
-                )
-            except httpx.HTTPError as error:
-                if attempt == _s3.ATTEMPTS or not isinstance(
-                    error, httpx.TransportError
-                ):
-                    raise _cannery.connection_error(service, error) from error
-            else:
+                return call()
+            except ResponseError as error:
                 if attempt == _s3.ATTEMPTS or not _s3.is_retryable_status(
-                    response.status_code
+                    error.status_code
                 ):
-                    return response
+                    raise VolumeAPIError(
+                        service, error.status_code, error.body
+                    ) from error
+            except httpx.TransportError as error:
+                if attempt == _s3.ATTEMPTS:
+                    raise _cannery.connection_error(service, error) from error
+            except httpx.HTTPError as error:
+                raise _cannery.connection_error(service, error) from error
             time.sleep(_s3.backoff_sec(attempt))
         raise AssertionError("unreachable: the retry loop returns or raises")
 
@@ -400,7 +463,7 @@ class _Materializer:
         resolution: ResolveResponse,
         root: Path,
         contained: _manifest.ContainedPaths,
-        options: VolumesClientOptions,
+        options: VolumeClientOptions,
     ) -> None:
         self._store = store
         self._namespace = ref.namespace
@@ -410,28 +473,31 @@ class _Materializer:
         self._options = options
         self._budget = _materialize.ByteBudget(options.max_bytes_in_flight)
 
-    def run(self, manifest: Manifest) -> tuple[int, int]:
+    def run(self, manifest: Manifest, selected: set[str] | None) -> tuple[int, int]:
         """Return bytes written and regular files created, hardlinks included."""
-        entries = manifest.entries
+        entries = [
+            e for e in manifest.entries if selected is None or e.clean_path in selected
+        ]
         groups = _manifest.hardlink_groups(entries)
         linked = {path for paths in groups.values() for path in paths[1:]}
         files: list[FileEntry] = [
-            entry
-            for entry in entries
-            if isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry))
-            and entry.clean_path not in linked
+            e
+            for e in entries
+            if isinstance(e, (ChunkFileEntry, ChunkmapFileEntry))
+            and e.clean_path not in linked
         ]
 
         # Every directory first, recorded or implied, on one thread: the pool
-        # then never races on mkdir. Modes come last, deepest first, so a
-        # read-only directory cannot block its own children.
-        for path in _manifest.implicit_directories(entries):
+        # then never races on mkdir. Modes and times come last, deepest first,
+        # so a read-only directory cannot block its own children and creating
+        # children cannot bump a parent's stamped mtime.
+        for path in _manifest.implicit_directories(e.clean_path for e in entries):
             _materialize.ensure_dir(self._root, path)
-        directory_modes: list[tuple[Path, int]] = []
+        directories: list[DirectoryEntry] = []
         for entry in entries:
             if isinstance(entry, DirectoryEntry):
-                path = _materialize.ensure_dir(self._root, entry.clean_path)
-                directory_modes.append((path, entry.mode_bits))
+                _materialize.ensure_dir(self._root, entry.clean_path)
+                directories.append(entry)
             elif isinstance(entry, SymlinkEntry):
                 _materialize.create_symlink(
                     self._join(entry.clean_path),
@@ -445,13 +511,18 @@ class _Materializer:
             for path in paths[1:]:
                 _materialize.create_hardlink(self._join(path), source)
         for entry in files:
-            _materialize.apply_mode(self._join(entry.clean_path), entry.mode_bits)
-        deepest_first = sorted(
-            directory_modes, key=lambda item: len(item[0].parts), reverse=True
-        )
-        for path, mode in deepest_first:
-            _materialize.apply_mode(path, mode)
+            self._stamp(entry)
+        for entry in sorted(
+            directories, key=lambda d: d.clean_path.count("/"), reverse=True
+        ):
+            self._stamp(entry)
         return written, len(files) + len(linked)
+
+    def _stamp(self, entry: DirectoryEntry | FileEntry) -> None:
+        path = self._join(entry.clean_path)
+        if entry.mtime_ns is not None:
+            _materialize.apply_mtime(path, entry.mtime_ns)
+        _materialize.apply_mode(path, entry.mode_bits)
 
     def _join(self, entry_path: str) -> Path:
         return _materialize.contained_join(self._root, entry_path)
@@ -508,12 +579,37 @@ class _Materializer:
         return _object_key(self._org_id, self._namespace, relative_key)
 
 
+def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
+    parsed = VolumeRef.parse(ref) if isinstance(ref, str) else ref
+    if parsed.level is VolumeRefLevel.NAMESPACE:
+        raise VolumeRefError(
+            f"ref {parsed} names a namespace; this operation needs a volume"
+        )
+    return parsed
+
+
+def _ref_include(ref: VolumeRef) -> list[str]:
+    """A ref path narrows exactly as an include entry would; ``/`` narrows nothing."""
+    return [ref.path.removeprefix("/")] if ref.path and ref.path != "/" else []
+
+
 def _object_key(org_id: str, namespace: str, relative_key: str) -> str:
     return f"bdn/{org_id}/{namespace}/{relative_key}"
 
 
 def _staging_dir(dest: Path) -> Path:
     return dest.parent / f".{dest.name}.partial-{secrets.token_hex(4)}"
+
+
+def _check_destination(dest: Path, overwrite: bool) -> None:
+    if not dest.exists():
+        return
+    if not dest.is_dir():
+        raise VolumeDestinationError(f"{dest} exists and is not a directory")
+    if not overwrite and any(dest.iterdir()):
+        raise VolumeDestinationError(
+            f"{dest} is not empty; pass overwrite=True to write into it in place"
+        )
 
 
 def _check_free_space(dest: Path, total_size: int) -> None:
@@ -527,17 +623,6 @@ def _check_free_space(dest: Path, total_size: int) -> None:
         raise VolumeDestinationError(
             f"{dest} has {free} bytes free, the volume needs {total_size}; nothing was written"
         )
-
-
-def _public_resolved(resolution: ResolveResponse) -> ResolvedVolume:
-    resolved = resolution.resolved
-    return ResolvedVolume(
-        reference=resolved.reference,
-        org_id=resolved.org_id,
-        digest=resolved.origin_digest,
-        resolved_from=resolved.resolved_from,
-        sequence=resolved.sequence,
-    )
 
 
 def _now() -> dt.datetime:

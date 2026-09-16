@@ -1,4 +1,4 @@
-"""Manifest and chunkmap records, and the containment gate over their paths.
+"""Manifest and chunkmap records, the containment gate, and entry selection.
 
 A manifest is JSONL: one minified record per line, discriminated on ``_type``
 and, for files, ``_kind``. It is flat; every entry carries its full path and
@@ -8,8 +8,11 @@ large file's record points at.
 
 from __future__ import annotations
 
+import datetime as dt
 import posixpath
+import re
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -23,14 +26,18 @@ from pydantic import (
 
 from baseten.bdn.volumes._cannery import DIGEST_PATTERN, ObjectTarget
 from baseten.bdn.volumes._models import (
-    EntryKind,
-    FileInfo,
+    VolumeEntry,
+    VolumeEntryKind,
     VolumePathError,
     VolumeProtocolError,
     VolumeUnsupportedError,
 )
 
 MAX_SYMLINK_HOPS = 40
+# RFC 3339 with up to nanosecond precision, as the manifest records it.
+_RFC3339 = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"
+)
 
 
 class _Record(BaseModel):
@@ -60,6 +67,13 @@ class ChunkEntry(_Record):
 class _PathEntry(_Record):
     path: str
     mode: str = Field(pattern=r"^[0-7]{3,7}$")
+    mtime: str | None = None
+
+    @model_validator(mode="after")
+    def _mtime_parses(self) -> _PathEntry:
+        if self.mtime is not None and not _RFC3339.fullmatch(self.mtime):
+            raise ValueError(f"mtime {self.mtime!r} is not an RFC 3339 timestamp")
+        return self
 
     @property
     def mode_bits(self) -> int:
@@ -69,6 +83,30 @@ class _PathEntry(_Record):
     def clean_path(self) -> str:
         # Pre-rule manifests carry a leading slash; every join strips it.
         return self.path.lstrip("/")
+
+    @property
+    def mtime_ns(self) -> int | None:
+        """Recorded modification time as nanoseconds since the epoch."""
+        if self.mtime is None:
+            return None
+        match = _RFC3339.fullmatch(self.mtime)
+        assert match is not None, "validated on construction"
+        base, fraction, zone = match.groups()
+        seconds = dt.datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
+        return int(seconds.timestamp()) * 1_000_000_000 + int(
+            (fraction or "").ljust(9, "0")
+        )
+
+    @property
+    def mtime_datetime(self) -> dt.datetime | None:
+        ns = self.mtime_ns
+        if ns is None:
+            return None
+        # Integer arithmetic: a float of nanoseconds since the epoch rounds the microseconds.
+        seconds, remainder = divmod(ns, 1_000_000_000)
+        return dt.datetime.fromtimestamp(seconds, tz=dt.UTC) + dt.timedelta(
+            microseconds=remainder // 1000
+        )
 
 
 class DirectoryEntry(_PathEntry):
@@ -155,25 +193,36 @@ class Manifest(BaseModel):
     header: ManifestHeader
     entries: tuple[PathEntry, ...]
 
-    def file_infos(self) -> list[FileInfo]:
-        infos: list[FileInfo] = []
-        for entry in self.entries:
-            if isinstance(entry, DirectoryEntry):
-                kind, size, target = EntryKind.DIRECTORY, 0, None
-            elif isinstance(entry, SymlinkEntry):
-                kind, size, target = EntryKind.SYMLINK, 0, entry.target
-            else:
-                kind, size, target = EntryKind.FILE, entry.size, None
-            infos.append(
-                FileInfo(
-                    path=entry.clean_path,
-                    kind=kind,
-                    size=size,
-                    mode=entry.mode_bits,
-                    link_target=target,
-                )
-            )
-        return infos
+    def public_entries(self, paths: Iterable[str] | None = None) -> list[VolumeEntry]:
+        """Entries as callers see them, slash-prefixed and in path order, optionally only ``paths``."""
+        wanted = None if paths is None else set(paths)
+        selected = [e for e in self.entries if wanted is None or e.clean_path in wanted]
+        selected.sort(key=lambda entry: entry.clean_path.split("/"))
+        return [_public_entry(entry) for entry in selected]
+
+    def files(self) -> list[FileEntry]:
+        return [
+            e
+            for e in self.entries
+            if isinstance(e, (ChunkFileEntry, ChunkmapFileEntry))
+        ]
+
+
+def _public_entry(entry: PathEntry) -> VolumeEntry:
+    if isinstance(entry, DirectoryEntry):
+        kind, size, target = VolumeEntryKind.DIRECTORY, 0, None
+    elif isinstance(entry, SymlinkEntry):
+        kind, size, target = VolumeEntryKind.SYMLINK, 0, entry.target
+    else:
+        kind, size, target = VolumeEntryKind.FILE, entry.size, None
+    return VolumeEntry(
+        path="/" + entry.clean_path,
+        kind=kind,
+        size=size,
+        mode=entry.mode_bits,
+        mtime=entry.mtime_datetime,
+        link_target=target,
+    )
 
 
 def _lines(body: bytes, what: str) -> list[bytes]:
@@ -322,10 +371,11 @@ class ContainedPaths:
             raise VolumePathError(
                 f"symlink {link_path!r} forms a chain longer than {MAX_SYMLINK_HOPS} hops"
             )
-        real: list[str] = (
-            [] if target.startswith("/") else posixpath.dirname(link_path).split("/")
+        real = (
+            []
+            if target.startswith("/")
+            else [p for p in posixpath.dirname(link_path).split("/") if p]
         )
-        real = [part for part in real if part]
         for part in target.split("/"):
             if part in ("", "."):
                 continue
@@ -353,7 +403,7 @@ class ContainedPaths:
         return posixpath.relpath(resolved or ".", start=link_dir or ".")
 
 
-def hardlink_groups(entries: tuple[PathEntry, ...]) -> dict[int, list[str]]:
+def hardlink_groups(entries: Iterable[PathEntry]) -> dict[int, list[str]]:
     """Paths per ``link_group``, in manifest order; the first one is materialized."""
     groups: dict[int, list[str]] = defaultdict(list)
     for entry in entries:
@@ -365,12 +415,44 @@ def hardlink_groups(entries: tuple[PathEntry, ...]) -> dict[int, list[str]]:
     return {group: paths for group, paths in groups.items() if len(paths) > 1}
 
 
-def implicit_directories(entries: tuple[PathEntry, ...]) -> list[str]:
-    """Every ancestor directory an entry needs, whether or not the manifest records it."""
+def implicit_directories(paths: Iterable[str]) -> list[str]:
+    """Every ancestor directory the given entry paths need, shallowest first."""
     seen: set[str] = set()
-    for entry in entries:
-        parent = posixpath.dirname(entry.clean_path)
+    for path in paths:
+        parent = posixpath.dirname(path)
         while parent and parent not in seen:
             seen.add(parent)
             parent = posixpath.dirname(parent)
     return sorted(seen, key=lambda path: path.count("/"))
+
+
+def select_paths(
+    entries: tuple[PathEntry, ...], include: Sequence[str]
+) -> set[str] | None:
+    """Entry paths named by ``include``, or ``None`` when nothing narrows.
+
+    Each include is an exact path or a directory whose contents are wanted,
+    matched on slash boundaries and relative to the volume root. Recorded
+    ancestors of a selected entry are selected too, so their modes apply. An
+    include that matches nothing is an error rather than a smaller pull.
+    """
+    prefixes = {item.strip("/") for item in include}
+    prefixes.discard("")
+    if not prefixes:
+        return None
+    by_path = {entry.clean_path: entry for entry in entries}
+    selected: set[str] = set()
+    for prefix in prefixes:
+        matched = {
+            path for path in by_path if path == prefix or path.startswith(prefix + "/")
+        }
+        if not matched:
+            raise VolumePathError(f"include {prefix!r} matches no entry in the volume")
+        selected |= matched
+    for path in list(selected):
+        parent = posixpath.dirname(path)
+        while parent:
+            if parent in by_path:
+                selected.add(parent)
+            parent = posixpath.dirname(parent)
+    return selected

@@ -111,6 +111,11 @@ def apply_mode(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def apply_mtime(path: Path, mtime_ns: int) -> None:
+    """Stamp a file or directory; symlinks are not stamped, as the CLI does not."""
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+
+
 class ByteBudget:
     """Bounds bytes held in memory across worker threads.
 
