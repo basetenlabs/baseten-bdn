@@ -55,22 +55,22 @@ class VolumeRef:
     """
 
     namespace: str
-    volume: str = ""
-    tag: str = ""
-    digest: str = ""
+    volume: str | None = None
+    tag: str | None = None
+    digest: str | None = None
     """Lowercase hex, 1 to 64 characters, optionally prefixed ``b3:``, kept as read.
     Fewer than 64 characters is a prefix; whether it is long enough or unique is
     decided by the service. Every digest this package writes carries the prefix
     and all 64 characters."""
 
-    path: str = ""
-    """Position within the version, spelled like a URL path: empty means no path,
-    ``/`` the root, otherwise slash-prefixed with no trailing slash."""
+    path: str | None = None
+    """Position within the version, spelled like a URL path: ``/`` is the root,
+    otherwise slash-prefixed with no trailing slash. ``None`` names no path."""
 
     def __post_init__(self) -> None:
         if not self.namespace:
             raise VolumeRefError("ref names no namespace")
-        if not self.volume and (self.tag or self.digest or self.path):
+        if self.volume is None and (self.tag or self.digest or self.path):
             raise VolumeRefError(f"ref {self} names no volume to select within")
         if self.tag and self.digest:
             raise VolumeRefError(
@@ -100,7 +100,7 @@ class VolumeRef:
         if len(segments) == 1 or (len(segments) == 2 and segments[1] == ""):
             return cls(namespace=namespace)
         volume_segment = segments[1]
-        tag = digest = ""
+        tag = digest = None
         # The first "@" wins over any ":", so "vol:a:b" is volume "vol" with
         # the invalid tag "a:b" rather than volume "vol:a" with tag "b".
         if (at := volume_segment.find("@")) >= 0:
@@ -110,18 +110,18 @@ class VolumeRef:
             tag = _tag(text, volume_segment[colon + 1 :])
             volume_segment = volume_segment[:colon]
         volume = _name(text, "volume", volume_segment, _RESERVED_VOLUMES)
-        path = _path(text, segments[2]) if len(segments) == 3 else ""
+        path = _path(text, segments[2]) if len(segments) == 3 else None
         return cls(
             namespace=namespace, volume=volume, tag=tag, digest=digest, path=path
         )
 
     @property
     def level(self) -> VolumeRefLevel:
-        if self.path:
+        if self.path is not None:
             return VolumeRefLevel.PATH
-        if self.tag or self.digest:
+        if self.tag is not None or self.digest is not None:
             return VolumeRefLevel.POINT
-        if self.volume:
+        if self.volume is not None:
             return VolumeRefLevel.VOLUME
         return VolumeRefLevel.NAMESPACE
 
@@ -143,27 +143,27 @@ class VolumeRef:
         return replace(self, path=_path(str(self), path.removeprefix("/")))
 
     def without_path(self) -> VolumeRef:
-        return replace(self, path="")
+        return replace(self, path=None)
 
     def shorthand(self) -> str:
         """The canonical form with a full digest cut to its first 12 characters."""
-        hex_digest = self.digest.removeprefix(_DIGEST_ALGORITHM)
+        hex_digest = (self.digest or "").removeprefix(_DIGEST_ALGORITHM)
         if len(hex_digest) == _DIGEST_MAX:
             return str(replace(self, digest=hex_digest[:_DIGEST_SHORTHAND]))
         return str(self)
 
     def __str__(self) -> str:
         text = f"{_SCHEME}{self.namespace}/"
-        if not self.volume:
+        if self.volume is None:
             return text
         text += self.volume
-        if self.digest:
+        if self.digest is not None:
             text += f"@{self.digest}"
-        elif self.tag:
+        elif self.tag is not None:
             text += f":{self.tag}"
         if self.path == "/":
             return text + "/"
-        for segment in self.path.split("/"):
+        for segment in (self.path or "").split("/"):
             if segment:
                 text += "/" + quote(segment, safe=_SEGMENT_SAFE)
         return text

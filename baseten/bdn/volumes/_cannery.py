@@ -1,6 +1,8 @@
-"""Cannery wire types for the volume read path.
+"""Cannery wire types for the volume read path. Nothing here is exported.
 
-Cannery is the BDN control service. A client never reads volume bytes through
+These models mirror cannery's resolve response field for field; the public
+surface is :class:`VolumeRef`, :class:`VolumeManifest`, and friends in
+``_models``. Cannery is the BDN control service. A client never reads volume bytes through
 it: it asks cannery to resolve a ref and gets back the version's manifest
 digest plus scoped credentials for the origin bucket. The token cannery
 expects is minted through the Baseten API, which baseten-python wraps.
@@ -14,7 +16,7 @@ from typing import TypeVar
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from baseten.bdn.volumes._models import (
+from baseten.bdn.volumes._errors import (
     VolumeAPIError,
     VolumeConnectionError,
     VolumeProtocolError,
@@ -28,7 +30,11 @@ _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 class ObjectTarget(BaseModel):
-    """Where an object lives, relative to the namespace's key prefix."""
+    """Where an object lives in the origin bucket, relative to the namespace's key prefix.
+
+    The full key is ``bdn/<org_id>/<namespace>/<relative_key>``; every chunk,
+    chunkmap, and manifest is addressed this way.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -36,13 +42,28 @@ class ObjectTarget(BaseModel):
 
 
 class ResolvedRef(BaseModel):
+    """The version a ref resolved to, as cannery reports it."""
+
     reference: str
+    """The ref as cannery parsed it."""
+
     org_id: str
+    """Organization the token belongs to; part of every object key."""
+
     origin_digest: str = Field(pattern=DIGEST_PATTERN)
+    """BLAKE3 digest of the version's manifest; the pin the public API returns."""
+
     kind: str
+    """Always ``manifest`` from resolve."""
+
     target: ObjectTarget
+    """Where the manifest object lives."""
+
     sequence: int | None = None
+    """Snapshot sequence the version was committed at; absent for old versions."""
+
     resolved_from: str
+    """``head``, ``tag``, or ``pin``."""
 
 
 class OriginCredentials(BaseModel):

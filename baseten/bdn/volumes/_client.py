@@ -37,6 +37,14 @@ from baseten.client.managementapi import (
 from baseten.bdn._useragent import user_agent
 from baseten.bdn.volumes import _cannery, _manifest, _materialize, _s3
 from baseten.bdn.volumes._cannery import OriginCredentials, ResolveResponse
+from baseten.bdn.volumes._errors import (
+    VolumeAPIError,
+    VolumeConnectionError,
+    VolumeDestinationError,
+    VolumeIntegrityError,
+    VolumeRefError,
+    VolumeUnsupportedError,
+)
 from baseten.bdn.volumes._manifest import (
     ChunkEntry,
     ChunkFileEntry,
@@ -48,13 +56,7 @@ from baseten.bdn.volumes._manifest import (
 )
 from baseten.bdn.volumes._models import (
     PullResult,
-    VolumeAPIError,
-    VolumeConnectionError,
-    VolumeDestinationError,
-    VolumeIntegrityError,
     VolumeManifest,
-    VolumeRefError,
-    VolumeUnsupportedError,
 )
 from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
 
@@ -334,6 +336,8 @@ class VolumeClient:
         self.close()
 
     def _token(self, ref: VolumeRef) -> CreateVolumeTokenResponse:
+        if ref.volume is None:
+            raise VolumeRefError(f"ref {ref} names no volume to mint a token for")
         key = (ref.namespace, ref.volume)
         with self._tokens_lock:
             cached = self._tokens.get(key)

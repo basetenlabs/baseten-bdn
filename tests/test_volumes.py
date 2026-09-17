@@ -645,7 +645,7 @@ def test_pull_narrows_by_ref_path_and_include_without_moving_entries(
         2,
         6,
     )
-    assert result.version_ref.path == "", "the version ref carries no path"
+    assert result.version_ref.path is None, "the version ref carries no path"
     assert len(services.s3_requests()) == 1 + 1 + 1
     with pytest.raises(VolumePathError, match="matches no entry"):
         services.client().pull(REF, tmp_path / "out2", include=["adapter/missing"])

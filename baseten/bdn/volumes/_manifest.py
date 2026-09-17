@@ -25,12 +25,14 @@ from pydantic import (
 )
 
 from baseten.bdn.volumes._cannery import DIGEST_PATTERN, ObjectTarget
-from baseten.bdn.volumes._models import (
-    VolumeEntry,
-    VolumeEntryKind,
+from baseten.bdn.volumes._errors import (
     VolumePathError,
     VolumeProtocolError,
     VolumeUnsupportedError,
+)
+from baseten.bdn.volumes._models import (
+    VolumeEntry,
+    VolumeEntryKind,
 )
 
 MAX_SYMLINK_HOPS = 40
@@ -210,9 +212,9 @@ class Manifest(BaseModel):
 
 def _public_entry(entry: PathEntry) -> VolumeEntry:
     if isinstance(entry, DirectoryEntry):
-        kind, size, target = VolumeEntryKind.DIRECTORY, 0, None
+        kind, size, target = VolumeEntryKind.DIRECTORY, None, None
     elif isinstance(entry, SymlinkEntry):
-        kind, size, target = VolumeEntryKind.SYMLINK, 0, entry.target
+        kind, size, target = VolumeEntryKind.SYMLINK, None, entry.target
     else:
         kind, size, target = VolumeEntryKind.FILE, entry.size, None
     return VolumeEntry(

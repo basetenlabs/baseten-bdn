@@ -6,36 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from baseten.bdn.volumes._errors import (
-    VolumeAPIError,
-    VolumeConnectionError,
-    VolumeDestinationError,
-    VolumeError,
-    VolumeIntegrityError,
-    VolumePathError,
-    VolumeProtocolError,
-    VolumeRefError,
-    VolumeStorageError,
-    VolumeUnsupportedError,
-)
 from baseten.bdn.volumes._ref import VolumeRef
-
-__all__ = [
-    "PullResult",
-    "VolumeAPIError",
-    "VolumeConnectionError",
-    "VolumeDestinationError",
-    "VolumeEntry",
-    "VolumeEntryKind",
-    "VolumeError",
-    "VolumeIntegrityError",
-    "VolumeManifest",
-    "VolumePathError",
-    "VolumeProtocolError",
-    "VolumeRefError",
-    "VolumeStorageError",
-    "VolumeUnsupportedError",
-]
 
 
 class VolumeEntryKind(StrEnum):
@@ -57,11 +28,11 @@ class VolumeEntry(BaseModel):
 
     kind: VolumeEntryKind
 
-    size: int = Field(ge=0)
-    """A file's length in bytes; zero for directories and symlinks."""
+    size: int | None = Field(default=None, ge=0)
+    """A file's length in bytes; ``None`` for directories and symlinks, which have none of their own."""
 
-    mode: int
-    """Recorded permission bits, including setuid, setgid, and sticky."""
+    mode: int | None = None
+    """Recorded permission bits, including setuid, setgid, and sticky; ``None`` when unrecorded."""
 
     mtime: dt.datetime | None = None
     """Modification time recorded when the version was published, if any."""

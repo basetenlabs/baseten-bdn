@@ -15,7 +15,10 @@ import sys
 import threading
 from pathlib import Path
 
-from baseten.bdn.volumes._models import VolumeDestinationError, VolumeUnsupportedError
+from baseten.bdn.volumes._errors import (
+    VolumeDestinationError,
+    VolumeUnsupportedError,
+)
 
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)

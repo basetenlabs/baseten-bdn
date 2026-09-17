@@ -20,7 +20,7 @@ import blake3
 import httpx
 
 from baseten.bdn.volumes._cannery import OriginCredentials
-from baseten.bdn.volumes._models import (
+from baseten.bdn.volumes._errors import (
     VolumeConnectionError,
     VolumeIntegrityError,
     VolumeProtocolError,

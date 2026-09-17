@@ -7,21 +7,23 @@ tool shares.
 """
 
 from baseten.bdn.volumes._client import VolumeClient, VolumeClientOptions
-from baseten.bdn.volumes._models import (
-    PullResult,
+from baseten.bdn.volumes._errors import (
     VolumeAPIError,
     VolumeConnectionError,
     VolumeDestinationError,
-    VolumeEntry,
-    VolumeEntryKind,
     VolumeError,
     VolumeIntegrityError,
-    VolumeManifest,
     VolumePathError,
     VolumeProtocolError,
     VolumeRefError,
     VolumeStorageError,
     VolumeUnsupportedError,
+)
+from baseten.bdn.volumes._models import (
+    PullResult,
+    VolumeEntry,
+    VolumeEntryKind,
+    VolumeManifest,
 )
 from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
 
