@@ -96,11 +96,15 @@ wheels = [
 
 [[package]]
 name = "baseten"
-version = "0.10.0"
-source = { git = "https://github.com/basetenlabs/baseten-python?rev=main#d3d9c8c3b2e6a96d27b92b9555105c04e7bbe5f3" }
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/b3/17b558da9fc5cdb9da879e4fd5ce636bf9ad63a45b451c84e548755a812b/baseten-0.11.0.tar.gz", hash = "sha256:ad38641389ae0cc0274d52c4c26fc8ca8ae09799bb06ce38fad647c64eec7225", size = 287077, upload-time = "2026-09-17T15:53:46.016Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/f2/90f9d5cd9f417fb56bbcfbcc1ab94d3e2fb2ac63d92fca3a4ccd0510f2b8/baseten-0.11.0-py3-none-any.whl", hash = "sha256:d13d8426bc10a2953c8df2788a6d8f6ea8fb8ea5fd2fe5961c2ad621ff6d95ba", size = 99188, upload-time = "2026-09-17T15:53:44.634Z" },
 ]
 
 [[package]]
@@ -127,7 +131,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'", specifier = ">=1.7.0" },
-    { name = "baseten", git = "https://github.com/basetenlabs/baseten-python?rev=main" },
+    { name = "baseten", specifier = ">=0.11,<1" },
     { name = "blake3", specifier = ">=1.0.9" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.0" },
