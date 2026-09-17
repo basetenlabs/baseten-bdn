@@ -777,19 +777,13 @@ def test_empty_files_cost_no_object_read(tmp_path: Path) -> None:
     assert len(services.s3_requests()) == 1
 
 
-def test_resolve_returns_the_pinned_ref_and_fetch_manifest_reads_only_the_manifest() -> (
-    None
-):
+def test_fetch_manifest_reads_only_the_manifest_and_pins_the_version() -> None:
     services = FakeServices(build_volume(sample_tree()))
     volumes = services.client()
 
-    resolved = volumes.resolve(REF)
-    assert resolved == pinned(services)
-    assert resolved.level is VolumeRefLevel.POINT
-    assert services.s3_requests() == []
-
     manifest = volumes.fetch_manifest(REF)
     assert manifest.version_ref == pinned(services)
+    assert manifest.version_ref.level is VolumeRefLevel.POINT
     assert (manifest.entry_count, manifest.total_size) == (10, SAMPLE_TOTAL_SIZE)
     assert [e.path for e in manifest.entries][:4] == [
         "/adapter",
@@ -806,8 +800,7 @@ def test_resolve_returns_the_pinned_ref_and_fetch_manifest_reads_only_the_manife
     assert by_path["/adapter/config.json"].mtime == dt.datetime(
         2026, 9, 15, 12, 34, 56, 123456, tzinfo=dt.UTC
     )
-    assert len(services.s3_requests()) == 1
-    assert len(services.token_requests()) == 1, "one token covers both calls"
+    assert len(services.s3_requests()) == 1, "only the manifest object is read"
 
     narrowed = volumes.fetch_manifest(f"{REF}/adapter/sub")
     assert [e.path for e in narrowed.entries] == [
@@ -822,20 +815,20 @@ def test_resolve_returns_the_pinned_ref_and_fetch_manifest_reads_only_the_manife
 
 def test_namespace_refs_are_refused_for_volume_operations() -> None:
     with pytest.raises(VolumeRefError, match="names a namespace"):
-        FakeServices(build_volume({})).client().resolve("bdn:loops")
+        FakeServices(build_volume({})).client().fetch_manifest("bdn:loops")
 
 
 def test_expired_token_is_minted_again() -> None:
     services = FakeServices(build_volume({}), token_expires_in=dt.timedelta(minutes=4))
     volumes = services.client()
-    volumes.resolve(REF)
-    volumes.resolve(REF)
+    volumes.fetch_manifest(REF)
+    volumes.fetch_manifest(REF)
     assert len(services.token_requests()) == 2
 
 
 def test_token_mint_retries_transient_errors_and_reports_rejections() -> None:
     flaky = FakeServices(build_volume({}), token_failures=[503, 502])
-    flaky.client().resolve(REF)
+    flaky.client().fetch_manifest(REF)
     assert len(flaky.token_requests()) == 3
 
     forbidden = FakeServices(
@@ -843,7 +836,7 @@ def test_token_mint_retries_transient_errors_and_reports_rejections() -> None:
         token_error=(403, {"code": "FORBIDDEN", "message": "volumes are not enabled"}),
     )
     with pytest.raises(VolumeAPIError) as raised:
-        forbidden.client().resolve(REF)
+        forbidden.client().fetch_manifest(REF)
     assert (raised.value.service, raised.value.status_code) == ("Baseten API", 403)
     assert "volumes are not enabled" in raised.value.message
     assert forbidden.resolve_requests() == []
@@ -966,7 +959,7 @@ def test_nothing_is_written_when_the_manifest_escapes(tmp_path: Path) -> None:
 
 def test_transient_resolve_errors_are_retried() -> None:
     services = FakeServices(build_volume({}), resolve_failures=[503, 502])
-    assert services.client().resolve(REF) == pinned(services)
+    assert services.client().fetch_manifest(REF).version_ref == pinned(services)
     assert len(services.resolve_requests()) == 3
 
 
@@ -986,7 +979,7 @@ def test_cannery_errors_carry_the_reason() -> None:
         ),
     )
     with pytest.raises(VolumeAPIError) as raised:
-        services.client().resolve(REF)
+        services.client().fetch_manifest(REF)
     assert (raised.value.service, raised.value.status_code, raised.value.reason) == (
         "cannery",
         404,
@@ -999,7 +992,7 @@ def test_non_envelope_cannery_errors_keep_the_body() -> None:
         build_volume({}), resolve_error=(502, "<html>bad gateway</html>")
     )
     with pytest.raises(VolumeAPIError) as raised:
-        services.client().resolve(REF)
+        services.client().fetch_manifest(REF)
     assert (raised.value.service, raised.value.status_code) == ("cannery", 502)
     assert "bad gateway" in raised.value.message
     assert len(services.resolve_requests()) == _s3.ATTEMPTS, (
@@ -1010,10 +1003,10 @@ def test_non_envelope_cannery_errors_keep_the_body() -> None:
 def test_missing_bdn_endpoint_is_an_error_unless_overridden() -> None:
     services = FakeServices(build_volume({}), bdn_endpoint=None)
     with pytest.raises(VolumeConnectionError, match="bdn_endpoint_override"):
-        services.client().resolve(REF)
-    assert services.client(bdn_endpoint_override="https://bdn.test").resolve(
+        services.client().fetch_manifest(REF)
+    assert services.client(bdn_endpoint_override="https://bdn.test").fetch_manifest(
         REF
-    ) == pinned(services)
+    ).version_ref == pinned(services)
 
 
 def test_slabmap_volumes_are_unsupported(tmp_path: Path) -> None:

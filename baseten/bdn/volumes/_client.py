@@ -1,4 +1,4 @@
-"""Client-side reads of BDN volumes: resolve, fetch a manifest, pull to a directory.
+"""Client-side reads of BDN volumes: fetch a manifest, pull to a directory.
 
 The read path touches three services:
 
@@ -192,16 +192,6 @@ class VolumeClient:
     def management_client(self) -> ManagementClient:
         """The baseten-python client used to mint volume tokens."""
         return self._management_client
-
-    def resolve(self, ref: str | VolumeRef) -> VolumeRef:
-        """Resolve a ref to the version it names, returned as a digest-pinned ref.
-
-        A bare volume resolves to its head; a tag or a digest prefix to that
-        point. A path on the ref is ignored. Pull the returned ref to get
-        exactly this version again.
-        """
-        parsed = _volume_or_point(ref)
-        return parsed.pinned(self._resolve(parsed).resolved.origin_digest)
 
     def fetch_manifest(self, ref: str | VolumeRef) -> VolumeManifest:
         """Read the manifest of the version ``ref`` names, without downloading content.

@@ -1,7 +1,7 @@
 """Client-side reads of BDN volumes.
 
-Use :class:`VolumeClient` with a Baseten API key to resolve a volume ref,
-read a version's manifest, or pull a version into a local directory.
+Use :class:`VolumeClient` with a Baseten API key to read a volume version's
+manifest or pull a version into a local directory.
 :class:`VolumeRef` parses and renders refs in the grammar every Baseten
 tool shares.
 """
