@@ -33,9 +33,8 @@ target name for reuse.
 
 ## Volumes
 
-From any machine with a Baseten API key, `baseten.bdn.volumes` resolves a
-volume ref, reads a version's manifest, or pulls a version into a local
-directory. The client mints a short-lived token through the Baseten API,
+From any machine with a Baseten API key, `baseten.bdn.volumes` reads a volume
+version's manifest or pulls a version into a local directory. The client mints a short-lived token through the Baseten API,
 resolves the ref, and reads the volume's objects directly from storage with
 the credentials it is given, verifying every object against its recorded
 digest.
