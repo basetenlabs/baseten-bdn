@@ -12,6 +12,9 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+    "backports-zstd>=1.7.0 ; python_full_version < '3.14'",
+    "baseten>=0.11,<1",
+    "blake3>=1.0.9",
     "httpx>=0.27",
     "pydantic>=2.0",
 ]
@@ -50,6 +53,9 @@ target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I"]
+
+[tool.ty.rules]
+unused-ignore-comment = "ignore"
 
 [build-system]
 requires = ["hatchling"]
