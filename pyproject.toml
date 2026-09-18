@@ -1,6 +1,6 @@
 [project]
 name = "baseten-bdn"
-version = "0.0.1"
+version = "0.1.0"
 description = "Python SDK for working with BDN inside and outside Baseten"
 readme = "README.md"
 license = "MIT"
