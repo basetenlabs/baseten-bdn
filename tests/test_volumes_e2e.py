@@ -2,13 +2,20 @@
 
 Set ``BASETEN_API_KEY`` and ``BASETEN_BDN_E2E_REF`` (a tag or digest ref to a
 version holding at least one directory) to run them, and ``BASETEN_BASE_URL``
-to point at an environment other than the public API.
+to point at an environment other than the public API. The pull comparisons
+also need the ``baseten`` CLI on ``PATH``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
+import stat
+import subprocess
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -93,3 +100,55 @@ def test_entry_listings_match_the_manifest(
     children = volumes.list(manifest.version_ref.with_path(directory.path))
     assert isinstance(children, VolumeEntryListing)
     assert all(e.path.startswith(directory.path + "/") for e in children.items)
+
+
+def snapshot(root: Path) -> dict[str, tuple[str, int, str]]:
+    """Every path below ``root`` with its kind, permission bits, and content or link target."""
+    tree: dict[str, tuple[str, int, str]] = {}
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        name = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(info.st_mode):
+            tree[name] = ("symlink", 0, os.readlink(path))
+        elif stat.S_ISDIR(info.st_mode):
+            tree[name] = ("directory", stat.S_IMODE(info.st_mode), "")
+        else:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            tree[name] = ("file", stat.S_IMODE(info.st_mode), digest)
+    return tree
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pull is POSIX only")
+@pytest.mark.skipif(shutil.which("baseten") is None, reason="needs the baseten CLI")
+@pytest.mark.parametrize(
+    ("subtree", "strip_prefix"), [(False, False), (True, False), (True, True)]
+)
+def test_pull_layouts_match_the_cli(
+    volumes: VolumeClient,
+    ref: VolumeRef,
+    tmp_path: Path,
+    subtree: bool,
+    strip_prefix: bool,
+) -> None:
+    pull_ref = ref
+    if subtree:
+        root = volumes.list(ref)
+        assert isinstance(root, VolumeEntryListing)
+        directory = next(e for e in root.items if e.kind is VolumeEntryKind.DIRECTORY)
+        pull_ref = ref.with_path(directory.path)
+
+    volumes.pull(pull_ref, tmp_path / "python", strip_prefix=strip_prefix)
+    subprocess.run(
+        [
+            "baseten",
+            "volume",
+            "pull",
+            str(pull_ref),
+            str(tmp_path / "cli"),
+            *(["--strip-prefix"] if strip_prefix else []),
+        ],
+        check=True,
+        env={**os.environ, "BASETEN_API_KEY": API_KEY},
+    )
+
+    assert snapshot(tmp_path / "python") == snapshot(tmp_path / "cli")

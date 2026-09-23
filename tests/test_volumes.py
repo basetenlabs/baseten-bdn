@@ -67,7 +67,8 @@ from tests.volume_fixtures import (
 )
 from tests.volume_fixtures import Volume as StoredVolume
 
-REF = f"bdn:{NAMESPACE}/{VOLUME}:step-100"
+VOLUME_REF = f"bdn:{NAMESPACE}/{VOLUME}"
+REF = f"{VOLUME_REF}:step-100"
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="pull is POSIX only")
 
 
@@ -600,6 +601,9 @@ def test_pull_materializes_the_tree_and_talks_to_all_three_services(
         6,
     )
     assert result.bytes_written == SAMPLE_BYTES
+    assert result.chunks_fetched == SAMPLE_OBJECT_GETS - 2, (
+        "all but manifest and chunkmap"
+    )
     assert result.dest_dir == dest
     assert [p.name for p in tmp_path.iterdir()] == ["ckpt"], (
         "no staging directory left behind"
@@ -658,6 +662,205 @@ def test_pull_narrows_by_ref_path_and_include_without_moving_entries(
     with pytest.raises(VolumePathError, match="matches no entry"):
         services.client().pull(REF, tmp_path / "out2", include=["adapter/missing"])
     assert not (tmp_path / "out2").exists()
+
+
+def tree_of(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+
+
+@posix_only
+def test_strip_prefix_lands_a_directory_ref_directly_below_dest(
+    tmp_path: Path,
+) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    dest = tmp_path / "out"
+
+    result = services.client().pull(f"{REF}/adapter", dest, strip_prefix=True)
+
+    assert tree_of(dest) == [
+        "abs",
+        "config.json",
+        "empty.marker",
+        "hardlink-a",
+        "hardlink-b",
+        "latest",
+        "sub",
+        "sub/note.txt",
+        "weights.bin",
+    ]
+    assert (dest / "weights.bin").read_bytes() == bytes(range(256)) * 64
+    assert os.readlink(dest / "latest") == "weights.bin"
+    assert os.readlink(dest / "abs") == "config.json", "absolute target re-rooted"
+    assert (dest / "hardlink-a").stat().st_ino == (dest / "hardlink-b").stat().st_ino
+    assert stat.S_IMODE((dest / "sub").stat().st_mode) == 0o555
+    assert (dest / "config.json").stat().st_mtime_ns == MTIME_NS
+    assert (result.file_count, result.total_file_count) == (6, 6)
+    assert result.version_ref == pinned(services)
+    assert [p.name for p in tmp_path.iterdir()] == ["out"], "staged, then renamed"
+
+
+@posix_only
+def test_strip_prefix_elides_the_directories_above_a_nested_ref(
+    tmp_path: Path,
+) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+
+    services.client().pull(f"{REF}/adapter/sub", tmp_path / "out", strip_prefix=True)
+
+    assert tree_of(tmp_path / "out") == ["note.txt"]
+    assert (tmp_path / "out/note.txt").read_bytes() == b"read-only dir child\n"
+    assert stat.S_IMODE((tmp_path / "out/note.txt").stat().st_mode) == 0o600
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("path", "name"), [("adapter/config.json", "config.json"), ("top.txt", "top.txt")]
+)
+def test_strip_prefix_lands_a_file_ref_by_its_basename(
+    tmp_path: Path, path: str, name: str
+) -> None:
+    tree = sample_tree()
+    tree["top.txt"] = File(b"at the root\n")
+    services = FakeServices(build_volume(tree))
+
+    result = services.client().pull(
+        f"{REF}/{path}", tmp_path / "out", strip_prefix=True
+    )
+
+    assert tree_of(tmp_path / "out") == [name]
+    assert result.file_count == 1
+
+
+@posix_only
+def test_strip_prefix_of_directories_no_record_describes_and_empty_ones(
+    tmp_path: Path,
+) -> None:
+    services = FakeServices(
+        build_volume({"a/b/c.txt": File(b"c"), "e": Dir(), "e/f": Dir(mode="0700")})
+    )
+    volumes = services.client()
+
+    volumes.pull(f"{REF}/a", tmp_path / "implied", strip_prefix=True)
+    volumes.pull(f"{REF}/e", tmp_path / "empty-child", strip_prefix=True)
+    volumes.pull(f"{REF}/e/f", tmp_path / "empty", strip_prefix=True)
+
+    assert tree_of(tmp_path / "implied") == ["b", "b/c.txt"]
+    assert tree_of(tmp_path / "empty-child") == ["f"]
+    assert stat.S_IMODE((tmp_path / "empty-child/f").stat().st_mode) == 0o700
+    assert (tmp_path / "empty").is_dir() and tree_of(tmp_path / "empty") == []
+
+
+@pytest.mark.parametrize("ref", [REF, f"{REF}/", VOLUME_REF])
+def test_strip_prefix_needs_a_path_on_the_ref(tmp_path: Path, ref: str) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    with pytest.raises(VolumeRefError, match="names no path for strip_prefix"):
+        services.client().pull(ref, tmp_path / "out", strip_prefix=True)
+    assert services.requests == [], "refused before any request"
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("tree", "ref_path", "include", "match"),
+    [
+        (
+            None,
+            "adapter/sub",
+            ["adapter/config.json"],
+            r"/adapter/config.json is outside /adapter/sub",
+        ),
+        (
+            None,
+            "adapter/config.json",
+            ["adapter/sub"],
+            "is outside /adapter/config.json",
+        ),
+        (None, "adapter/latest", [], "is a symlink"),
+        (
+            {"a": Dir(), "a/up": Symlink("../b"), "b": File(b"b")},
+            "a",
+            [],
+            r"symlink /a/up points at /b, which is outside /a",
+        ),
+        (
+            {"a": Dir(), "a/abs": Symlink("/b"), "b": File(b"b")},
+            "a",
+            [],
+            r"symlink /a/abs points at /b, which is outside /a",
+        ),
+    ],
+)
+def test_strip_prefix_refuses_what_it_has_no_place_for_before_writing(
+    tmp_path: Path,
+    tree: dict[str, File | Dir | Symlink] | None,
+    ref_path: str,
+    include: list[str],
+    match: str,
+) -> None:
+    services = FakeServices(build_volume(tree or sample_tree()))
+
+    with pytest.raises(VolumePathError, match=match):
+        services.client().pull(
+            f"{REF}/{ref_path}", tmp_path / "out", include=include, strip_prefix=True
+        )
+
+    assert list(tmp_path.iterdir()) == []
+    assert len(services.s3_requests()) == 1, "only the manifest was read"
+
+
+@posix_only
+def test_strip_prefix_rewrites_links_that_stay_inside_the_ref_path(
+    tmp_path: Path,
+) -> None:
+    services = FakeServices(
+        build_volume(
+            {
+                "a": Dir(),
+                "a/x": File(b"x"),
+                "a/sub": Dir(),
+                "a/sub/up": Symlink("../x"),
+                "a/sub/root": Symlink("/a"),
+                "a/sub/detour": Symlink("../../a/x"),
+            }
+        )
+    )
+
+    services.client().pull(f"{REF}/a", tmp_path / "out", strip_prefix=True)
+
+    out = tmp_path / "out"
+    assert os.readlink(out / "sub/up") == "../x"
+    assert os.readlink(out / "sub/root") == ".."
+    assert os.readlink(out / "sub/detour") == "../x", "no longer climbs above dest"
+    assert (out / "sub/detour").read_bytes() == b"x"
+
+
+@posix_only
+def test_strip_prefix_with_overwrite_writes_in_place(tmp_path: Path) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    dest = tmp_path / "out"
+    dest.mkdir()
+    (dest / "unrelated.txt").write_bytes(b"keep")
+    (dest / "config.json").write_bytes(b"stale")
+
+    services.client().pull(f"{REF}/adapter", dest, overwrite=True, strip_prefix=True)
+
+    assert (dest / "config.json").read_bytes() == b'{"r": 16}\n'
+    assert (dest / "unrelated.txt").read_bytes() == b"keep"
+
+
+@posix_only
+def test_failed_strip_prefix_pull_leaves_nothing(tmp_path: Path) -> None:
+    volume = build_volume(sample_tree())
+    volume.objects[full_key(_s3.digest_of(b"read-only dir child\n"))] = (
+        b"tampered",
+        CHUNK,
+    )
+
+    with pytest.raises(VolumeIntegrityError):
+        FakeServices(volume).client().pull(
+            f"{REF}/adapter", tmp_path / "out", strip_prefix=True
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 @posix_only
@@ -1067,7 +1270,6 @@ def test_byte_budget_admits_oversized_requests_alone() -> None:
 
 # --- listing and describing -------------------------------------------------
 
-VOLUME_REF = f"bdn:{NAMESPACE}/{VOLUME}"
 TOMBSTONED_DIGEST = "b3:" + "d" * 64
 
 

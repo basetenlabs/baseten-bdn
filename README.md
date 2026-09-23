@@ -35,11 +35,33 @@ print(result.version_ref, result.file_count, result.bytes_written)
 
 Refs are `bdn:<namespace>/<volume>` with an optional `:<tag>` or `@<digest>`
 selector and an optional `/path` inside the version; `VolumeRef` parses and
-renders them. A path on the ref, or `include=[...]`, narrows a pull to those
-entries without moving them. A pull is staged next to `dest_dir` and renamed
-into place once complete, so a failed pull leaves nothing behind; pass
-`overwrite=True` to write into an existing directory in place. Pulling is
-supported on Linux and macOS.
+renders them. A pull is staged next to `dest_dir` and renamed into place once
+complete, so a failed pull leaves nothing behind; pass `overwrite=True` to
+write into an existing directory in place, which leaves files the volume does
+not describe alone. Pulling is supported on Linux and macOS.
+
+### Choosing what a pull writes, and where
+
+A path on the ref, or `include=[...]`, narrows a pull to those entries without
+moving them. `strip_prefix=True` drops the ref's path from where entries land
+instead, so a directory's contents land directly in `dest_dir` and a file
+lands by its basename. It never changes what is selected: an `include` must
+stay within the ref's path, and a symlink that resolves above it is refused,
+both before anything is written.
+
+Given a version holding `tokenizer/tokenizer.json` and
+`weights/model.safetensors`:
+
+```python
+ref = "bdn:team/model:production"
+
+volumes.pull(ref, "./out")                              # out/tokenizer/…, out/weights/…
+volumes.pull(f"{ref}/tokenizer", "./out")               # out/tokenizer/tokenizer.json
+volumes.pull(ref, "./out", include=["tokenizer"])       # out/tokenizer/tokenizer.json
+volumes.pull(f"{ref}/tokenizer", "./out", strip_prefix=True)  # out/tokenizer.json
+volumes.pull(f"{ref}/tokenizer/tokenizer.json", "./out", strip_prefix=True)  # out/tokenizer.json
+volumes.pull(ref, "./existing", overwrite=True)         # in place, others left alone
+```
 
 ### Listing and describing
 
