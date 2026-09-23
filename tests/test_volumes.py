@@ -1764,3 +1764,29 @@ def test_open_needs_a_path_to_a_file(ref: str) -> None:
     with pytest.raises(VolumeRefError, match="names no file|names a namespace"):
         services.client().read_bytes(ref)
     assert services.requests == []
+
+
+def test_a_repeated_pagination_cursor_is_a_protocol_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = FakeServices(build_volume({}), namespaces=["alpha", "beta"])
+    monkeypatch.setattr(
+        services,
+        "_page",
+        lambda request, items: httpx.Response(
+            200,
+            json={"items": items[:1], "pagination": {"has_more": True, "cursor": "1"}},
+        ),
+    )
+    with pytest.raises(VolumeProtocolError, match="repeated pagination cursor"):
+        services.client().list()
+    assert len(services.inventory_requests()) == 2
+
+
+def test_open_reads_ahead_no_more_than_max_concurrency_chunks() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    with services.client(max_concurrency=2).open(
+        f"{REF}/adapter/weights.bin"
+    ) as source:
+        assert len(source._requested) == 2
+        assert source.read() == WEIGHTS

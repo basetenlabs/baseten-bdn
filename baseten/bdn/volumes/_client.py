@@ -647,36 +647,34 @@ class VolumeClient:
 
     # builtins.list: the list() method shadows the builtin in this class body.
     def _list_namespaces(self) -> builtins.list[VolumeNamespace]:
-        items: list[VolumeNamespace] = []
-        request = api.GetVolumesNamespacesRequest(limit=_PAGE_LIMIT)
-        while True:
-            page = self._api(
+        def page(
+            cursor: str | None,
+        ) -> tuple[builtins.list[str], api.PaginationResponse]:
+            request = api.GetVolumesNamespacesRequest(limit=_PAGE_LIMIT, cursor=cursor)
+            response = self._api(
                 functools.partial(
                     self._management_client.api.get_volumes_namespaces, request=request
                 )
             )
-            items.extend(VolumeNamespace(name=name) for name in page.items)
-            if not page.pagination.has_more or page.pagination.cursor is None:
-                return items
-            request = api.GetVolumesNamespacesRequest(
-                limit=_PAGE_LIMIT, cursor=page.pagination.cursor
-            )
+            return response.items, response.pagination
+
+        return [VolumeNamespace(name=name) for name in _paginate(page)]
 
     def _list_volumes(self, namespace: str) -> builtins.list[Volume]:
-        items: list[Volume] = []
-        request = api.GetVolumesRequest(namespace=namespace, limit=_PAGE_LIMIT)
-        while True:
-            page = self._api(
+        def page(
+            cursor: str | None,
+        ) -> tuple[builtins.list[api.Volume], api.PaginationResponse]:
+            request = api.GetVolumesRequest(
+                namespace=namespace, limit=_PAGE_LIMIT, cursor=cursor
+            )
+            response = self._api(
                 functools.partial(
                     self._management_client.api.get_volumes, request=request
                 )
             )
-            items.extend(_volume(volume) for volume in page.items)
-            if not page.pagination.has_more or page.pagination.cursor is None:
-                return items
-            request = api.GetVolumesRequest(
-                namespace=namespace, limit=_PAGE_LIMIT, cursor=page.pagination.cursor
-            )
+            return response.items, response.pagination
+
+        return [_volume(volume) for volume in _paginate(page)]
 
     def _open_version(self, ref: VolumeRef) -> Version:
         """Resolve ``ref`` once and read the manifest of the version it names."""
@@ -866,6 +864,26 @@ def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
 def _ref_include(ref: VolumeRef) -> list[str]:
     """A ref path narrows exactly as an include entry would; ``/`` narrows nothing."""
     return [ref.path.removeprefix("/")] if ref.path and ref.path != "/" else []
+
+
+def _paginate(
+    page: Callable[[str | None], tuple[list[_T], api.PaginationResponse]],
+) -> list[_T]:
+    """Every item across a cursor-paginated listing."""
+    items: list[_T] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        batch, pagination = page(cursor)
+        items.extend(batch)
+        if not pagination.has_more or pagination.cursor is None:
+            return items
+        if pagination.cursor in seen:
+            raise VolumeProtocolError(
+                f"Baseten API repeated pagination cursor {pagination.cursor!r}"
+            )
+        seen.add(pagination.cursor)
+        cursor = pagination.cursor
 
 
 def _refuse_recursive_inventory(recursive: bool, what: str) -> None:

@@ -3,7 +3,7 @@
 Set ``BASETEN_API_KEY`` and ``BASETEN_BDN_E2E_REF`` (a tag or digest ref to a
 version holding at least one directory) to run them, and ``BASETEN_BASE_URL``
 to point at an environment other than the public API. The pull comparisons
-also need the ``baseten`` CLI on ``PATH``.
+also need the ``baseten`` CLI on ``PATH`` and run only against the public API.
 """
 
 from __future__ import annotations
@@ -120,6 +120,10 @@ def snapshot(root: Path) -> dict[str, tuple[str, int, str]]:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="pull is POSIX only")
 @pytest.mark.skipif(shutil.which("baseten") is None, reason="needs the baseten CLI")
+@pytest.mark.skipif(
+    "BASETEN_BASE_URL" in os.environ,
+    reason="the CLI reads its environment from its profile, not BASETEN_BASE_URL",
+)
 @pytest.mark.parametrize(
     ("subtree", "strip_prefix"), [(False, False), (True, False), (True, True)]
 )

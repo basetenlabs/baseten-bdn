@@ -232,7 +232,7 @@ class PullResult(BaseModel):
 
     total_file_count: int = Field(ge=0)
 
-    chunks_fetched: int = Field(ge=0)
+    chunks_fetched: int = Field(default=0, ge=0)
     """Chunk objects read from the origin bucket; empty files and hardlinked copies cost none."""
 
     duration_sec: float = Field(ge=0)

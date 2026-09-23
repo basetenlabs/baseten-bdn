@@ -18,10 +18,11 @@ class VolumeFileReader(io.BufferedIOBase):
     Returned by :meth:`VolumeClient.open`. Every chunk is verified against its
     recorded digest and length before any of its bytes are returned, so a
     corrupt chunk raises from the ``read`` that would first have returned
-    them. Chunks are fetched on a thread pool up to ``max_concurrency`` at a
-    time. Beyond the chunk being read, those in flight or fetched are bounded
-    by ``max_bytes_in_flight``, charged twice per chunk for its stored and
-    decoded copies; a chunk larger than that is fetched alone.
+    them. Beyond the chunk being read, at most ``max_concurrency`` chunks are
+    in flight or fetched ahead, and they are also bounded by
+    ``max_bytes_in_flight``, charged twice per chunk for its stored and
+    decoded copies; a chunk larger than that is fetched alone. A slow reader
+    therefore holds a few chunks, not the pull's whole memory budget.
 
     ``read``, ``read1``, ``readinto``, ``readline``, ``peek``, and iteration
     work; the stream is not seekable. It is not safe to share between threads.
@@ -46,6 +47,7 @@ class VolumeFileReader(io.BufferedIOBase):
         self._requested: deque[tuple[ChunkEntry, Future[bytes]]] = deque()
         self._requested_bytes = 0
         self._max_bytes_in_flight = max_bytes_in_flight
+        self._max_ahead = max_concurrency
         self._pool = ThreadPoolExecutor(
             max_workers=max_concurrency, thread_name_prefix="bdn-volume-read"
         )
@@ -119,9 +121,9 @@ class VolumeFileReader(io.BufferedIOBase):
     def _request_ahead(self) -> None:
         while self._unrequested:
             charge = 2 * self._unrequested[0].length
-            if (
-                self._requested
-                and self._requested_bytes + charge > self._max_bytes_in_flight
+            if self._requested and (
+                len(self._requested) >= self._max_ahead
+                or self._requested_bytes + charge > self._max_bytes_in_flight
             ):
                 return
             chunk = self._unrequested.popleft()
