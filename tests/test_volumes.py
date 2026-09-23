@@ -13,14 +13,19 @@ import httpx
 import pytest
 
 from baseten.bdn.volumes import (
+    NamespaceListing,
+    Volume,
     VolumeAPIError,
     VolumeClient,
     VolumeClientOptions,
     VolumeConnectionError,
     VolumeDestinationError,
+    VolumeEntry,
     VolumeEntryKind,
+    VolumeEntryListing,
     VolumeError,
     VolumeIntegrityError,
+    VolumeListing,
     VolumePathError,
     VolumeProtocolError,
     VolumeRef,
@@ -28,6 +33,7 @@ from baseten.bdn.volumes import (
     VolumeRefLevel,
     VolumeStorageError,
     VolumeUnsupportedError,
+    VolumeVersionDetail,
     _client,
     _manifest,
     _s3,
@@ -48,7 +54,8 @@ from tests.volume_fixtures import (
     FakeServices,
     File,
     Symlink,
-    Volume,
+    api_version,
+    api_volume,
     build_volume,
     chunk_record,
     full_key,
@@ -58,6 +65,7 @@ from tests.volume_fixtures import (
     s3_error,
     zstd,
 )
+from tests.volume_fixtures import Volume as StoredVolume
 
 REF = f"bdn:{NAMESPACE}/{VOLUME}:step-100"
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="pull is POSIX only")
@@ -1010,7 +1018,7 @@ def test_missing_bdn_endpoint_is_an_error_unless_overridden() -> None:
 
 
 def test_slabmap_volumes_are_unsupported(tmp_path: Path) -> None:
-    volume = Volume()
+    volume = StoredVolume()
     volume.put_manifest(
         [
             manifest_header(1),
@@ -1055,3 +1063,305 @@ def test_byte_budget_admits_oversized_requests_alone() -> None:
     budget.release(50)
     with pytest.raises(ValueError):
         ByteBudget(0)
+
+
+# --- listing and describing -------------------------------------------------
+
+VOLUME_REF = f"bdn:{NAMESPACE}/{VOLUME}"
+TOMBSTONED_DIGEST = "b3:" + "d" * 64
+
+
+def paths(listing: VolumeEntryListing) -> list[str]:
+    return [entry.path for entry in listing.items]
+
+
+def test_list_without_a_ref_walks_every_namespace_page() -> None:
+    services = FakeServices(
+        build_volume({}), namespaces=["alpha", "beta", "gamma"], page_size=2
+    )
+    volumes = services.client()
+
+    listing = volumes.list()
+
+    assert isinstance(listing, NamespaceListing)
+    assert [n.name for n in listing.items] == ["alpha", "beta", "gamma"]
+    assert listing.items[0].ref == VolumeRef("alpha")
+    first, second = services.inventory_requests()
+    assert first.url.path == "/v1/volumes/namespaces"
+    assert first.url.params["limit"] == "1000" and "cursor" not in first.url.params
+    assert second.url.params["cursor"] == "2"
+    assert volumes.list("bdn:") == listing
+    assert services.token_requests() == [], "inventory needs no cannery token"
+    with pytest.raises(VolumeRefError, match="takes no recursion"):
+        volumes.list(recursive=True)
+
+
+def test_list_namespace_ref_walks_every_volume_page() -> None:
+    digest = "b3:" + "a" * 64
+    services = FakeServices(
+        build_volume({}),
+        volumes=[
+            api_volume("first", digest),
+            api_volume("second", None),
+            api_volume("third", digest),
+        ],
+        page_size=2,
+    )
+
+    listing = services.client().list(f"bdn:{NAMESPACE}")
+
+    assert isinstance(listing, VolumeListing)
+    assert listing.namespace == NAMESPACE
+    assert [v.name for v in listing.items] == ["first", "second", "third"]
+    first = listing.items[0]
+    assert first.kind == "volume" and first.ref == VolumeRef(NAMESPACE, "first")
+    assert first.head is not None
+    assert first.head.version_ref == VolumeRef(NAMESPACE, "first", digest=digest)
+    assert first.head.total_size == 1234
+    assert [(t.name, t.digest) for t in first.tags] == [("step-100", digest)]
+    assert (first.tag_count, first.versions_alive, first.versions_tombstoned) == (
+        2,
+        3,
+        1,
+    )
+    assert listing.items[1].head is None
+    assert [r.url.params.get("cursor") for r in services.inventory_requests()] == [
+        None,
+        "2",
+    ]
+    assert {r.method for r in services.inventory_requests()} == {"GET"}
+    with pytest.raises(VolumeRefError, match="takes no recursion"):
+        services.client().list(f"bdn:{NAMESPACE}", recursive=True)
+
+
+def test_list_entries_lists_immediate_children_of_one_pinned_version() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    volumes = services.client()
+
+    root = volumes.list(REF)
+    adapter = volumes.list(f"{REF}/adapter")
+
+    assert isinstance(root, VolumeEntryListing) and isinstance(
+        adapter, VolumeEntryListing
+    )
+    assert paths(root) == ["/adapter"]
+    assert paths(adapter) == [
+        "/adapter/abs",
+        "/adapter/config.json",
+        "/adapter/empty.marker",
+        "/adapter/hardlink-a",
+        "/adapter/hardlink-b",
+        "/adapter/latest",
+        "/adapter/sub",
+        "/adapter/weights.bin",
+    ]
+    assert adapter.version_ref == pinned(services), "tag resolved to its digest"
+    by_path = {e.path: e for e in adapter.items}
+    assert by_path["/adapter/sub"].kind is VolumeEntryKind.DIRECTORY
+    assert by_path["/adapter/sub"].mode == 0o555
+    assert by_path["/adapter/weights.bin"].size == 16384
+    assert by_path["/adapter/latest"].link_target == "weights.bin"
+    assert [r.url.params["ref"] for r in services.resolve_requests()] == [REF, REF], (
+        "each listing resolves once, without its path"
+    )
+    assert len(services.s3_requests()) == 2, "only manifests are read"
+
+    head = volumes.list(VOLUME_REF)
+    assert isinstance(head, VolumeEntryListing) and paths(head) == ["/adapter"]
+    assert services.resolve_requests()[-1].url.params["ref"] == VOLUME_REF
+
+
+def test_list_entries_recursively_lists_every_descendant() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    volumes = services.client()
+
+    under = volumes.list(f"{REF}/adapter", recursive=True)
+    everything = volumes.list(REF, recursive=True)
+
+    assert isinstance(under, VolumeEntryListing)
+    assert isinstance(everything, VolumeEntryListing)
+    assert "/adapter" not in paths(under), "the listed directory is not its own entry"
+    assert "/adapter/sub/note.txt" in paths(under)
+    assert len(under.items) == 9
+    assert paths(everything) == ["/adapter", *paths(under)]
+
+
+def test_list_synthesizes_directories_no_record_describes() -> None:
+    services = FakeServices(
+        build_volume(
+            {
+                "a/b/c.txt": File(b"c"),
+                "a/d.txt": File(b"d"),
+                "e/f.txt": File(b"f"),
+                "e/g": Dir(mode="0700"),
+                "e/g/h.txt": File(b"h"),
+            }
+        )
+    )
+    volumes = services.client()
+
+    root = volumes.list(REF)
+    a = volumes.list(f"{REF}/a")
+    e = volumes.list(f"{REF}/e")
+    flat = volumes.list(REF, recursive=True)
+
+    assert isinstance(root, VolumeEntryListing)
+    assert root.items == [
+        VolumeEntry(path="/a", kind=VolumeEntryKind.DIRECTORY),
+        VolumeEntry(path="/e", kind=VolumeEntryKind.DIRECTORY),
+    ]
+    assert isinstance(a, VolumeEntryListing) and paths(a) == ["/a/b", "/a/d.txt"]
+    assert a.items[0].mode is None, "implied, so nothing is recorded"
+    assert isinstance(e, VolumeEntryListing)
+    assert [(x.path, x.mode) for x in e.items] == [
+        ("/e/f.txt", 0o644),
+        ("/e/g", 0o700),
+    ], "a record replaces the synthesized directory, whatever order it came in"
+    assert isinstance(flat, VolumeEntryListing)
+    assert paths(flat) == ["/a/b/c.txt", "/a/d.txt", "/e/f.txt", "/e/g", "/e/g/h.txt"]
+
+
+@pytest.mark.parametrize(
+    ("path", "match"),
+    [
+        ("adapter/config.json", "is a file, which has no entries"),
+        ("adapter/latest", "is a symlink, which has no entries"),
+        ("adapter/missing", "has no entry at /adapter/missing"),
+    ],
+)
+def test_list_entries_rejects_paths_that_are_not_directories(
+    path: str, match: str
+) -> None:
+    with pytest.raises(VolumePathError, match=match):
+        FakeServices(build_volume(sample_tree())).client().list(f"{REF}/{path}")
+
+
+def test_describe_a_volume() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+
+    volume = services.client().describe(VOLUME_REF)
+
+    assert isinstance(volume, Volume) and volume.kind == "volume"
+    assert volume.ref == VolumeRef(NAMESPACE, VOLUME) and volume.name == VOLUME
+    assert volume.head is not None and volume.head.version_ref == pinned(services)
+    assert volume.head.created_at == dt.datetime(2026, 9, 15, 12, 34, 56, tzinfo=dt.UTC)
+    (request,) = services.inventory_requests()
+    assert (request.method, request.url.path) == (
+        "GET",
+        f"/v1/volumes/{NAMESPACE}/{VOLUME}",
+    )
+    assert services.resolve_requests() == [], "described through the Baseten API alone"
+
+
+@pytest.mark.parametrize(
+    ("selector", "encoded"),
+    [(":step-100", "%3Astep-100"), ("@{digest}", "%40b3%3A{hex}")],
+)
+def test_describe_a_version_pins_it(selector: str, encoded: str) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    digest = services.volume.manifest_digest
+    hex_digest = digest.removeprefix("b3:")
+
+    version = services.client().describe(VOLUME_REF + selector.format(digest=digest))
+
+    assert isinstance(version, VolumeVersionDetail) and version.kind == "version"
+    assert version.version_ref == pinned(services)
+    assert (version.digest, version.entry_count, version.total_size) == (
+        digest,
+        10,
+        1234,
+    )
+    assert version.is_head and version.tags == ["step-100"]
+    assert (version.lifecycle, version.tombstoned_at) == ("ALIVE", None)
+    (request,) = services.inventory_requests()
+    assert request.url.raw_path.decode().endswith(
+        "/versions/" + encoded.format(hex=hex_digest)
+    )
+
+
+def test_describe_an_unknown_tag_is_an_api_error() -> None:
+    with pytest.raises(VolumeAPIError) as caught:
+        FakeServices(build_volume({})).client().describe(f"{VOLUME_REF}:missing")
+    assert (caught.value.service, caught.value.status_code) == ("Baseten API", 404)
+
+
+@pytest.mark.parametrize(
+    ("ref", "match"),
+    [
+        (f"bdn:{NAMESPACE}", "names a namespace, which has nothing to describe"),
+        (f"{REF}/adapter", r"list\(\) or fetch_manifest\(\)"),
+        (f"{VOLUME_REF}/adapter", r"list\(\) or fetch_manifest\(\)"),
+    ],
+)
+def test_describe_refuses_namespaces_and_paths(ref: str, match: str) -> None:
+    services = FakeServices(build_volume({}))
+    with pytest.raises(VolumeRefError, match=match):
+        services.client().describe(ref)
+    assert services.requests == []
+
+
+def test_list_versions_leaves_out_tombstoned_versions_unless_asked() -> None:
+    services = FakeServices(build_volume({}))
+    alive = services.volume.manifest_digest
+    services.versions = [
+        api_version(alive),
+        api_version(
+            TOMBSTONED_DIGEST,
+            lifecycle="TOMBSTONED",
+            is_head=False,
+            tags=[],
+            sequence=None,
+            total_size_bytes=None,
+            tombstoned_at="2026-09-16T00:00:00Z",
+            delete_after="2026-10-16T00:00:00Z",
+        ),
+    ]
+    volumes = services.client()
+
+    live = volumes.list_versions(VOLUME_REF)
+    every = volumes.list_versions(VOLUME_REF, include_tombstoned=True)
+
+    assert live.volume_ref == VolumeRef(NAMESPACE, VOLUME)
+    assert [v.digest for v in live.items] == [alive]
+    assert [v.lifecycle for v in every.items] == ["ALIVE", "TOMBSTONED"]
+    gone = every.items[1]
+    assert gone.version_ref == VolumeRef(NAMESPACE, VOLUME, digest=TOMBSTONED_DIGEST)
+    assert (gone.sequence, gone.total_size) == (None, None)
+    assert gone.delete_after == dt.datetime(2026, 10, 16, tzinfo=dt.UTC)
+    assert [
+        r.url.params["include_tombstoned"] for r in services.inventory_requests()
+    ] == ["false", "true"]
+    assert {r.method for r in services.inventory_requests()} == {"GET"}
+
+
+@pytest.mark.parametrize("ref", [f"bdn:{NAMESPACE}", REF, f"{VOLUME_REF}/adapter"])
+def test_list_versions_needs_exactly_a_volume(ref: str) -> None:
+    services = FakeServices(build_volume({}))
+    with pytest.raises(VolumeRefError, match="version history belongs to a volume"):
+        services.client().list_versions(ref)
+    assert services.requests == []
+
+
+def test_inventory_retries_transient_api_errors_and_reports_rejections() -> None:
+    services = FakeServices(build_volume({}), api_error=(503, {"error": "busy"}))
+    with pytest.raises(VolumeAPIError) as caught:
+        services.client().list()
+    assert caught.value.status_code == 503
+    assert len(services.inventory_requests()) == _s3.ATTEMPTS
+
+    services = FakeServices(build_volume({}), api_error=(403, {"error": "denied"}))
+    with pytest.raises(VolumeAPIError) as caught:
+        services.client().describe(VOLUME_REF)
+    assert (caught.value.service, caught.value.status_code) == ("Baseten API", 403)
+    assert len(services.inventory_requests()) == 1, "a rejection is not retried"
+
+
+def test_off_contract_inventory_is_a_protocol_error() -> None:
+    services = FakeServices(build_volume({}), volumes=[{"name": "no-other-fields"}])
+    with pytest.raises(VolumeProtocolError, match="off contract"):
+        services.client().list(f"bdn:{NAMESPACE}")
+
+    services = FakeServices(build_volume({}))
+    services.versions = [api_version("b3:short")]
+    with pytest.raises(VolumeProtocolError, match="unusable digest"):
+        services.client().list_versions(VOLUME_REF)
