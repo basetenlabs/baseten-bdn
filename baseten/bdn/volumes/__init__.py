@@ -2,8 +2,8 @@
 
 Use :class:`VolumeClient` with a Baseten API key to list namespaces, volumes,
 and a version's entries, describe a volume or version, read version history,
-read a version's manifest, or pull a version into a local directory. Every
-operation is read-only.
+read a version's manifest, read or stream one file, or pull a version into a
+local directory. Every operation is read-only.
 :class:`VolumeRef` parses and renders refs in the grammar every Baseten
 tool shares.
 """
@@ -37,6 +37,7 @@ from baseten.bdn.volumes._models import (
     VolumeVersionDetail,
     VolumeVersionListing,
 )
+from baseten.bdn.volumes._reader import VolumeFileReader
 from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
 
 __all__ = [
@@ -52,6 +53,7 @@ __all__ = [
     "VolumeEntryKind",
     "VolumeEntryListing",
     "VolumeError",
+    "VolumeFileReader",
     "VolumeHead",
     "VolumeIntegrityError",
     "VolumeListing",

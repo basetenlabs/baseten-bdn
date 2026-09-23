@@ -200,7 +200,7 @@ class Manifest(BaseModel):
         wanted = None if paths is None else set(paths)
         selected = [e for e in self.entries if wanted is None or e.clean_path in wanted]
         selected.sort(key=lambda entry: entry.clean_path.split("/"))
-        return [_public_entry(entry) for entry in selected]
+        return [public_entry(entry) for entry in selected]
 
     def files(self) -> list[FileEntry]:
         return [
@@ -210,7 +210,7 @@ class Manifest(BaseModel):
         ]
 
 
-def _public_entry(entry: PathEntry) -> VolumeEntry:
+def public_entry(entry: PathEntry) -> VolumeEntry:
     if isinstance(entry, DirectoryEntry):
         kind, size, target = VolumeEntryKind.DIRECTORY, None, None
     elif isinstance(entry, SymlinkEntry):
@@ -348,6 +348,37 @@ class ContainedPaths:
             if isinstance(entry, SymlinkEntry):
                 self._real_target(path, entry.target, hops=0)
                 self._rendered[path] = self._render(path, entry.target)
+
+    def file_at(self, path: str) -> FileEntry:
+        """The regular file at ``path``, following symlinks at every component.
+
+        Symlinks are followed by the same walk the containment gate uses, so
+        a path resolves exactly where a pulled tree's link would lead.
+        """
+        spelled = path.strip("/")
+        real: list[str] = []
+        for part in spelled.split("/"):
+            real.append(part)
+            here = "/".join(real)
+            entry = self.by_path.get(here)
+            if isinstance(entry, SymlinkEntry):
+                real = self._real_target(here, entry.target, hops=0)
+        resolved = "/".join(real)
+        named = f"/{spelled}" + (
+            f" (resolved to /{resolved})" if resolved != spelled else ""
+        )
+        entry = self.by_path.get(resolved)
+        if isinstance(entry, (ChunkFileEntry, ChunkmapFileEntry)):
+            return entry
+        if (
+            isinstance(entry, DirectoryEntry)
+            or not resolved
+            or any(other.startswith(resolved + "/") for other in self.by_path)
+        ):
+            raise VolumePathError(
+                f"{named} is a directory; only a file has bytes to read"
+            )
+        raise VolumePathError(f"the version has no file at {named}")
 
     def rendered_symlink_target(self, entry: SymlinkEntry) -> str:
         """The target relative to the link's directory."""
@@ -525,7 +556,7 @@ def listed_entries(
     by_path = {entry.clean_path: entry for entry in entries}
     at = by_path.get(root) if root else None
     if at is not None and not isinstance(at, DirectoryEntry):
-        kind = _public_entry(at).kind
+        kind = public_entry(at).kind
         raise VolumePathError(f"/{root} is a {kind}, which has no entries beneath it")
     prefix = f"{root}/" if root else ""
     beneath = [entry for entry in entries if entry.clean_path.startswith(prefix)]
@@ -533,13 +564,13 @@ def listed_entries(
         raise VolumePathError(f"the version has no entry at /{root}")
     if recursive:
         beneath.sort(key=lambda entry: entry.clean_path.split("/"))
-        return [_public_entry(entry) for entry in beneath]
+        return [public_entry(entry) for entry in beneath]
     children: dict[str, VolumeEntry] = {}
     for entry in beneath:
         name, deeper, _ = entry.clean_path.removeprefix(prefix).partition("/")
         if not deeper:
             # A record for the directory itself replaces a synthesized one.
-            children[name] = _public_entry(entry)
+            children[name] = public_entry(entry)
         elif name not in children:
             children[name] = VolumeEntry(
                 path=f"/{prefix}{name}", kind=VolumeEntryKind.DIRECTORY

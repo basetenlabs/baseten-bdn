@@ -65,6 +65,29 @@ volumes.pull(
 volumes.pull(ref, "./existing", overwrite=True)  # in place, others left alone
 ```
 
+### Reading one file
+
+`read_bytes()` and `read_text()` return one file's verified content without
+writing anything to disk. `open()` streams it instead, fetching chunks ahead of
+the reader in bounded memory, and suits files too large to hold. The ref's
+path must name a file, or a symlink that leads to one inside the version.
+
+```python
+with VolumeClient(api_key="...") as volumes:
+    config = json.loads(volumes.read_text("bdn:team/model:production/config.json"))
+
+    with volumes.open("bdn:team/model:production/model.safetensors") as source:
+        print(source.version_ref, source.entry.size)
+        while chunk := source.read(8 << 20):
+            consume(chunk)
+```
+
+Every chunk is verified before any of its bytes are returned, so a corrupt one
+raises `VolumeIntegrityError` from the read that reaches it. A directory, a
+missing path, or a symlink that escapes the version raises `VolumePathError`,
+and a ref with no path raises `VolumeRefError`. The stream is forward-only;
+closing it early stops fetching without closing the client.
+
 ### Listing and describing
 
 `list()` returns what a ref names, depending on how much of a ref it is: no ref

@@ -47,7 +47,6 @@ from baseten.bdn.volumes._errors import (
     VolumeAPIError,
     VolumeConnectionError,
     VolumeDestinationError,
-    VolumeIntegrityError,
     VolumeProtocolError,
     VolumeRefError,
     VolumeUnsupportedError,
@@ -75,7 +74,9 @@ from baseten.bdn.volumes._models import (
     VolumeVersionDetail,
     VolumeVersionListing,
 )
+from baseten.bdn.volumes._reader import VolumeFileReader
 from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
+from baseten.bdn.volumes._version import Version, object_key
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -376,6 +377,60 @@ class VolumeClient:
             ],
         )
 
+    def open(self, ref: str | VolumeRef) -> VolumeFileReader:
+        """Open the file ``ref`` names for reading, without writing anything to disk.
+
+        The ref's path must name a regular file, or a symlink that leads to
+        one inside the version; a head or tag is resolved once, and the
+        reader's ``version_ref`` pins what is read. The reader streams the
+        file in bounded memory; see :class:`VolumeFileReader`. Close it, or use
+        it as a context manager, to stop fetching early.
+
+        Raises:
+            VolumeRefError: ``ref`` carries no path, or only ``/``.
+            VolumePathError: The path names nothing, a directory, or a symlink
+                whose target escapes the version or leads to no file.
+            VolumeIntegrityError: The chunkmap failed its digest check; a
+                chunk that fails its check raises from the read that reaches it.
+            VolumeAPIError: The Baseten API or cannery rejected a request.
+            VolumeStorageError: The origin bucket refused an object read.
+            VolumeUnsupportedError: The volume uses slabmap files.
+        """
+        parsed = _volume_or_point(ref)
+        if parsed.path is None or parsed.path == "/":
+            raise VolumeRefError(
+                f"ref {parsed} names no file to read; add the path of a file within "
+                f"the version, as in '{parsed.without_path()}/config.json'"
+            )
+        version = self._open_version(parsed)
+        contained = _manifest.ContainedPaths(version.manifest.entries)
+        entry = contained.file_at(parsed.path)
+        return VolumeFileReader(
+            version,
+            _manifest.public_entry(entry),
+            version.chunks(entry),
+            max_concurrency=self._options.max_concurrency,
+            max_bytes_in_flight=self._options.max_bytes_in_flight,
+        )
+
+    def read_bytes(self, ref: str | VolumeRef) -> bytes:
+        """The whole verified content of the file ``ref`` names, held in memory.
+
+        Raises what :meth:`open` and reading do.
+        """
+        with self.open(ref) as source:
+            return source.read()
+
+    def read_text(
+        self, ref: str | VolumeRef, *, encoding: str = "utf-8", errors: str = "strict"
+    ) -> str:
+        """The file ``ref`` names, verified and then decoded with ``encoding`` and ``errors``.
+
+        Raises what :meth:`read_bytes` does, and :class:`UnicodeDecodeError`
+        when the bytes do not decode under ``errors="strict"``.
+        """
+        return self.read_bytes(ref).decode(encoding, errors)
+
     def pull(
         self,
         ref: str | VolumeRef,
@@ -592,42 +647,40 @@ class VolumeClient:
 
     # builtins.list: the list() method shadows the builtin in this class body.
     def _list_namespaces(self) -> builtins.list[VolumeNamespace]:
-        items: list[VolumeNamespace] = []
-        request = api.GetVolumesNamespacesRequest(limit=_PAGE_LIMIT)
-        while True:
-            page = self._api(
+        def page(
+            cursor: str | None,
+        ) -> tuple[builtins.list[str], api.PaginationResponse]:
+            request = api.GetVolumesNamespacesRequest(limit=_PAGE_LIMIT, cursor=cursor)
+            response = self._api(
                 functools.partial(
                     self._management_client.api.get_volumes_namespaces, request=request
                 )
             )
-            items.extend(VolumeNamespace(name=name) for name in page.items)
-            if not page.pagination.has_more or page.pagination.cursor is None:
-                return items
-            request = api.GetVolumesNamespacesRequest(
-                limit=_PAGE_LIMIT, cursor=page.pagination.cursor
-            )
+            return response.items, response.pagination
+
+        return [VolumeNamespace(name=name) for name in _paginate(page)]
 
     def _list_volumes(self, namespace: str) -> builtins.list[Volume]:
-        items: list[Volume] = []
-        request = api.GetVolumesRequest(namespace=namespace, limit=_PAGE_LIMIT)
-        while True:
-            page = self._api(
+        def page(
+            cursor: str | None,
+        ) -> tuple[builtins.list[api.Volume], api.PaginationResponse]:
+            request = api.GetVolumesRequest(
+                namespace=namespace, limit=_PAGE_LIMIT, cursor=cursor
+            )
+            response = self._api(
                 functools.partial(
                     self._management_client.api.get_volumes, request=request
                 )
             )
-            items.extend(_volume(volume) for volume in page.items)
-            if not page.pagination.has_more or page.pagination.cursor is None:
-                return items
-            request = api.GetVolumesRequest(
-                namespace=namespace, limit=_PAGE_LIMIT, cursor=page.pagination.cursor
-            )
+            return response.items, response.pagination
 
-    def _open_version(self, ref: VolumeRef) -> _Version:
+        return [_volume(volume) for volume in _paginate(page)]
+
+    def _open_version(self, ref: VolumeRef) -> Version:
         """Resolve ``ref`` once and read the manifest of the version it names."""
         resolution = self._resolve(ref)
         store = self._object_store(ref, resolution)
-        return _Version(
+        return Version(
             ref=ref.pinned(resolution.resolved.origin_digest),
             org_id=resolution.resolved.org_id,
             store=store,
@@ -645,7 +698,7 @@ class VolumeClient:
         self, store: _s3.ObjectStore, ref: VolumeRef, resolution: ResolveResponse
     ) -> Manifest:
         resolved = resolution.resolved
-        key = _object_key(resolved.org_id, ref.namespace, resolved.target.relative_key)
+        key = object_key(resolved.org_id, ref.namespace, resolved.target.relative_key)
         body, content_type = store.get(key)
         data = _s3.decode_object(
             body,
@@ -654,21 +707,6 @@ class VolumeClient:
             expected_digest=resolved.origin_digest,
         )
         return _manifest.parse_manifest(data)
-
-
-@dataclass(frozen=True)
-class _Version:
-    """One resolved version: its pin, where its objects live, and its manifest."""
-
-    ref: VolumeRef
-    """The volume pinned to this version, with no path."""
-
-    org_id: str
-    store: _s3.ObjectStore
-    manifest: Manifest
-
-    def key(self, relative_key: str) -> str:
-        return _object_key(self.org_id, self.ref.namespace, relative_key)
 
 
 class _CredentialSource:
@@ -701,13 +739,12 @@ class _Materializer:
 
     def __init__(
         self,
-        version: _Version,
+        version: Version,
         root: Path,
         layout: _manifest.Layout,
         options: VolumeClientOptions,
     ) -> None:
         self._version = version
-        self._store = version.store
         self._root = root
         self._layout = layout
         self._options = options
@@ -796,41 +833,19 @@ class _Materializer:
             return sum(fetch.result() for fetch in fetches), len(fetches)
 
     def _plan_file(self, entry: FileEntry) -> tuple[Path, list[ChunkEntry]]:
+        chunks = self._version.chunks(entry)
         path = self._join(entry.clean_path)
-        if isinstance(entry, ChunkFileEntry):
-            _materialize.create_file(path, entry.size)
-            # An empty file's chunk is the empty digest; nothing to fetch.
-            return path, [entry.chunk] if entry.chunk.length else []
-        body, content_type = self._store.get(self._key(entry.target.relative_key))
-        data = _s3.decode_object(
-            body, content_type, expected_kind="chunkmap", expected_digest=entry.digest
-        )
-        chunks = _manifest.parse_chunkmap(data, entry.size)
         _materialize.create_file(path, entry.size)
-        return path, list(chunks)
+        return path, chunks
 
     def _fetch_chunk(self, path: Path, chunk: ChunkEntry) -> int:
-        # Compressed body and decoded bytes coexist until the write, so the
-        # budget is charged for both copies.
         charge = 2 * chunk.length
         self._budget.acquire(charge)
         try:
-            body, content_type = self._store.get(self._key(chunk.target.relative_key))
-            data = _s3.decode_object(
-                body, content_type, expected_kind="chunk", expected_digest=chunk.digest
-            )
-            del body
-            if len(data) != chunk.length:
-                raise VolumeIntegrityError(
-                    f"chunk {chunk.digest} is {len(data)} bytes, the record says {chunk.length}"
-                )
-            _materialize.write_at(path, chunk.offset, data)
+            _materialize.write_at(path, chunk.offset, self._version.read_chunk(chunk))
             return chunk.length
         finally:
             self._budget.release(charge)
-
-    def _key(self, relative_key: str) -> str:
-        return self._version.key(relative_key)
 
 
 def _parse(ref: str | VolumeRef) -> VolumeRef:
@@ -849,6 +864,26 @@ def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
 def _ref_include(ref: VolumeRef) -> list[str]:
     """A ref path narrows exactly as an include entry would; ``/`` narrows nothing."""
     return [ref.path.removeprefix("/")] if ref.path and ref.path != "/" else []
+
+
+def _paginate(
+    page: Callable[[str | None], tuple[list[_T], api.PaginationResponse]],
+) -> list[_T]:
+    """Every item across a cursor-paginated listing."""
+    items: list[_T] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        batch, pagination = page(cursor)
+        items.extend(batch)
+        if not pagination.has_more or pagination.cursor is None:
+            return items
+        if pagination.cursor in seen:
+            raise VolumeProtocolError(
+                f"Baseten API repeated pagination cursor {pagination.cursor!r}"
+            )
+        seen.add(pagination.cursor)
+        cursor = pagination.cursor
 
 
 def _refuse_recursive_inventory(recursive: bool, what: str) -> None:
@@ -914,10 +949,6 @@ def _version_fields(
         "tombstoned_at": version.tombstoned_at,
         "delete_after": version.delete_after,
     }
-
-
-def _object_key(org_id: str, namespace: str, relative_key: str) -> str:
-    return f"bdn/{org_id}/{namespace}/{relative_key}"
 
 
 def _staging_dir(dest: Path) -> Path:
