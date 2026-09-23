@@ -383,6 +383,7 @@ class VolumeClient:
         *,
         overwrite: bool = False,
         include: Sequence[str] = (),
+        strip_prefix: bool = False,
     ) -> PullResult:
         """Materialize the version ``ref`` names at ``dest_dir``.
 
@@ -399,9 +400,20 @@ class VolumeClient:
         its own path below ``dest_dir``. An include that matches nothing is an
         error rather than a smaller pull.
 
+        ``strip_prefix`` drops the path on ``ref`` from where entries land,
+        and changes nothing about what is selected. Pulling
+        ``bdn:ns/vol:tag/tokenizer`` into ``./out`` writes
+        ``./out/tokenizer.json`` with it and ``./out/tokenizer/tokenizer.json``
+        without it. A file ref lands by its basename. Everything selected must
+        then be within the ref's path, so an ``include`` elsewhere, or a
+        symlink whose target resolves above the path, is refused before
+        anything is written.
+
         Raises:
+            VolumeRefError: ``strip_prefix`` was passed with no path on ``ref``.
             VolumePathError: The manifest would place an entry outside
-                ``dest_dir``, or an include names nothing; nothing is written.
+                ``dest_dir``, an include names nothing, or ``strip_prefix``
+                has no place for a selected entry; nothing is written.
             VolumeDestinationError: ``dest_dir`` exists and is not empty
                 without ``overwrite``, has too little free space, or has a
                 file where a directory is needed.
@@ -418,14 +430,23 @@ class VolumeClient:
             )
         started = time.perf_counter()
         parsed = _volume_or_point(ref)
+        ref_path = _ref_include(parsed)
+        if strip_prefix and not ref_path:
+            raise VolumeRefError(
+                f"ref {parsed} names no path for strip_prefix to strip; "
+                "add the directory or file to drop, as in 'bdn:ns/vol:tag/tokenizer'"
+            )
         dest = Path(dest_dir)
         _check_destination(dest, overwrite)
         version = self._open_version(parsed)
         version_ref, manifest = version.ref, version.manifest
         contained = _manifest.ContainedPaths(manifest.entries)
-        selected = _manifest.select_paths(
-            manifest.entries, [*_ref_include(parsed), *include]
-        )
+        selected = _manifest.select_paths(manifest.entries, [*ref_path, *include])
+        if strip_prefix:
+            assert selected is not None, "a ref path always narrows"
+            layout = _manifest.Layout.stripped(contained, ref_path[0], selected)
+        else:
+            layout = _manifest.Layout(contained)
         _check_free_space(dest, manifest.header.total_size)
         logger.info(
             "pull %s: %d entries, %d bytes -> %s",
@@ -439,8 +460,8 @@ class VolumeClient:
         root = staging or dest
         try:
             root.mkdir(parents=True, exist_ok=True)
-            materializer = _Materializer(version, root, contained, self._options)
-            written, file_count = materializer.run(manifest, selected)
+            materializer = _Materializer(version, root, layout, self._options)
+            written, file_count, chunks = materializer.run(manifest, selected)
             if staging is not None:
                 if dest.exists():
                     dest.rmdir()
@@ -467,6 +488,7 @@ class VolumeClient:
             bytes_written=written,
             selected_file_count=file_count,
             total_file_count=total_files,
+            chunks_fetched=chunks,
             duration_sec=duration,
         )
 
@@ -681,20 +703,27 @@ class _Materializer:
         self,
         version: _Version,
         root: Path,
-        contained: _manifest.ContainedPaths,
+        layout: _manifest.Layout,
         options: VolumeClientOptions,
     ) -> None:
         self._version = version
         self._store = version.store
         self._root = root
-        self._contained = contained
+        self._layout = layout
         self._options = options
         self._budget = _materialize.ByteBudget(options.max_bytes_in_flight)
 
-    def run(self, manifest: Manifest, selected: set[str] | None) -> tuple[int, int]:
-        """Return bytes written and regular files created, hardlinks included."""
+    def run(
+        self, manifest: Manifest, selected: set[str] | None
+    ) -> tuple[int, int, int]:
+        """Return bytes written, regular files created (hardlinks included), and chunks fetched."""
+        # The layout places every selected entry but the directories a
+        # stripped prefix elides.
         entries = [
-            e for e in manifest.entries if selected is None or e.clean_path in selected
+            e
+            for e in manifest.entries
+            if (selected is None or e.clean_path in selected)
+            and self._layout.dest(e.clean_path) is not None
         ]
         groups = _manifest.hardlink_groups(entries)
         linked = {path for paths in groups.values() for path in paths[1:]}
@@ -709,20 +738,22 @@ class _Materializer:
         # then never races on mkdir. Modes and times come last, deepest first,
         # so a read-only directory cannot block its own children and creating
         # children cannot bump a parent's stamped mtime.
-        for path in _manifest.implicit_directories(e.clean_path for e in entries):
+        for path in _manifest.implicit_directories(
+            self._dest(e.clean_path) for e in entries
+        ):
             _materialize.ensure_dir(self._root, path)
         directories: list[DirectoryEntry] = []
         for entry in entries:
             if isinstance(entry, DirectoryEntry):
-                _materialize.ensure_dir(self._root, entry.clean_path)
+                _materialize.ensure_dir(self._root, self._dest(entry.clean_path))
                 directories.append(entry)
             elif isinstance(entry, SymlinkEntry):
                 _materialize.create_symlink(
                     self._join(entry.clean_path),
-                    self._contained.rendered_symlink_target(entry),
+                    self._layout.symlink_target(entry),
                 )
 
-        written = self._fetch_files(files)
+        written, chunks = self._fetch_files(files)
 
         for paths in groups.values():
             source = self._join(paths[0])
@@ -734,7 +765,7 @@ class _Materializer:
             directories, key=lambda d: d.clean_path.count("/"), reverse=True
         ):
             self._stamp(entry)
-        return written, len(files) + len(linked)
+        return written, len(files) + len(linked), chunks
 
     def _stamp(self, entry: DirectoryEntry | FileEntry) -> None:
         path = self._join(entry.clean_path)
@@ -742,10 +773,15 @@ class _Materializer:
             _materialize.apply_mtime(path, entry.mtime_ns)
         _materialize.apply_mode(path, entry.mode_bits)
 
-    def _join(self, entry_path: str) -> Path:
-        return _materialize.contained_join(self._root, entry_path)
+    def _dest(self, entry_path: str) -> str:
+        dest = self._layout.dest(entry_path)
+        assert dest is not None, f"{entry_path} was filtered out of the run"
+        return dest
 
-    def _fetch_files(self, files: Sequence[FileEntry]) -> int:
+    def _join(self, entry_path: str) -> Path:
+        return _materialize.contained_join(self._root, self._dest(entry_path))
+
+    def _fetch_files(self, files: Sequence[FileEntry]) -> tuple[int, int]:
         # Chunkmap reads are planned on the pool and their chunks submitted as
         # each plan lands, so payload transfer starts before every chunkmap is
         # in. Only the main thread submits, so no worker ever waits on another.
@@ -757,7 +793,7 @@ class _Materializer:
                 fetches.extend(
                     pool.submit(self._fetch_chunk, path, chunk) for chunk in chunks
                 )
-            return sum(fetch.result() for fetch in fetches)
+            return sum(fetch.result() for fetch in fetches), len(fetches)
 
     def _plan_file(self, entry: FileEntry) -> tuple[Path, list[ChunkEntry]]:
         path = self._join(entry.clean_path)

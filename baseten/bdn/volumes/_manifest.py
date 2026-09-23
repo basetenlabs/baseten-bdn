@@ -405,6 +405,89 @@ class ContainedPaths:
         return posixpath.relpath(resolved or ".", start=link_dir or ".")
 
 
+class Layout:
+    """Where each entry lands below the destination: at its own path, or below a stripped root.
+
+    ``root`` is the volume directory the destination stands for; ``""`` is
+    the volume root, which relocates nothing. An entry outside ``root``,
+    which is only ever ``root`` itself or a directory above it, has no place
+    and is not written.
+    """
+
+    def __init__(self, contained: ContainedPaths, root: str = "") -> None:
+        self.root = root
+        self._contained = contained
+
+    @classmethod
+    def stripped(
+        cls, contained: ContainedPaths, ref_path: str, selected: set[str]
+    ) -> Layout:
+        """The layout that drops ``ref_path``, checked against ``selected`` before anything is written.
+
+        A directory's contents land directly below the destination and a
+        file lands by its basename. Every selected entry must be at or under
+        ``ref_path`` or be one of its ancestors, and every selected symlink
+        must resolve inside the relocated tree.
+        """
+        at = contained.by_path.get(ref_path)
+        if isinstance(at, SymlinkEntry):
+            raise VolumePathError(
+                f"strip_prefix needs a directory or a file, and /{ref_path} is a symlink"
+            )
+        root = (
+            posixpath.dirname(ref_path)
+            if at is not None and not isinstance(at, DirectoryEntry)
+            else ref_path
+        )
+        layout = cls(contained, root)
+        for path in sorted(selected):
+            if not (
+                path == ref_path
+                or path.startswith(ref_path + "/")
+                or ref_path.startswith(path + "/")
+            ):
+                raise VolumePathError(
+                    f"/{path} is outside /{ref_path}, so strip_prefix has no place for it; "
+                    "an include must select within the ref's path"
+                )
+            entry = contained.by_path[path]
+            if isinstance(entry, SymlinkEntry) and layout.dest(path) is not None:
+                layout._stripped_target(entry)
+        return layout
+
+    def dest(self, path: str) -> str | None:
+        """``path`` relative to the destination, or ``None`` when it has no place there."""
+        if not self.root:
+            return path
+        if path.startswith(self.root + "/"):
+            return path[len(self.root) + 1 :]
+        return None
+
+    def symlink_target(self, entry: SymlinkEntry) -> str:
+        """The target to create, relative to the link's directory below the destination."""
+        if not self.root:
+            return self._contained.rendered_symlink_target(entry)
+        return self._stripped_target(entry)
+
+    def _stripped_target(self, entry: SymlinkEntry) -> str:
+        # Containment was judged against the whole volume; a target that stays
+        # inside it can still climb above the root this layout relocates.
+        link = entry.clean_path
+        resolved = posixpath.normpath(
+            posixpath.join(
+                posixpath.dirname(link), self._contained.rendered_symlink_target(entry)
+            )
+        )
+        if resolved != self.root and not resolved.startswith(self.root + "/"):
+            raise VolumePathError(
+                f"symlink /{link} points at /{resolved}, which is outside /{self.root}, "
+                "so strip_prefix has no place for it"
+            )
+        target = resolved[len(self.root) + 1 :] if resolved != self.root else "."
+        link_dir = posixpath.dirname(self.dest(link) or "")
+        return posixpath.relpath(target, start=link_dir or ".")
+
+
 def hardlink_groups(entries: Iterable[PathEntry]) -> dict[int, list[str]]:
     """Paths per ``link_group``, in manifest order; the first one is materialized."""
     groups: dict[int, list[str]] = defaultdict(list)
