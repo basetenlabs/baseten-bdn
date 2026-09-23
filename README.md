@@ -55,12 +55,14 @@ Given a version holding `tokenizer/tokenizer.json` and
 ```python
 ref = "bdn:team/model:production"
 
-volumes.pull(ref, "./out")                              # out/tokenizer/…, out/weights/…
-volumes.pull(f"{ref}/tokenizer", "./out")               # out/tokenizer/tokenizer.json
-volumes.pull(ref, "./out", include=["tokenizer"])       # out/tokenizer/tokenizer.json
+volumes.pull(ref, "./out")  # out/tokenizer/…, out/weights/…
+volumes.pull(f"{ref}/tokenizer", "./out")  # out/tokenizer/tokenizer.json
+volumes.pull(ref, "./out", include=["tokenizer"])  # out/tokenizer/tokenizer.json
 volumes.pull(f"{ref}/tokenizer", "./out", strip_prefix=True)  # out/tokenizer.json
-volumes.pull(f"{ref}/tokenizer/tokenizer.json", "./out", strip_prefix=True)  # out/tokenizer.json
-volumes.pull(ref, "./existing", overwrite=True)         # in place, others left alone
+volumes.pull(
+    f"{ref}/tokenizer/tokenizer.json", "./out", strip_prefix=True
+)  # out/tokenizer.json
+volumes.pull(ref, "./existing", overwrite=True)  # in place, others left alone
 ```
 
 ### Listing and describing

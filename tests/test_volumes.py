@@ -750,6 +750,7 @@ def test_strip_prefix_of_directories_no_record_describes_and_empty_ones(
     assert (tmp_path / "empty").is_dir() and tree_of(tmp_path / "empty") == []
 
 
+@posix_only
 @pytest.mark.parametrize("ref", [REF, f"{REF}/", VOLUME_REF])
 def test_strip_prefix_needs_a_path_on_the_ref(tmp_path: Path, ref: str) -> None:
     services = FakeServices(build_volume(sample_tree()))
