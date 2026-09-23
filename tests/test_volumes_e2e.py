@@ -152,3 +152,29 @@ def test_pull_layouts_match_the_cli(
     )
 
     assert snapshot(tmp_path / "python") == snapshot(tmp_path / "cli")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the comparison pull is POSIX only")
+def test_reads_match_a_pull_of_the_same_file(
+    volumes: VolumeClient, ref: VolumeRef, tmp_path: Path
+) -> None:
+    flat = volumes.list(ref, recursive=True)
+    assert isinstance(flat, VolumeEntryListing)
+    files = sorted(
+        (e for e in flat.items if e.kind is VolumeEntryKind.FILE),
+        key=lambda e: e.size or 0,
+    )
+    assert files, "BASETEN_BDN_E2E_REF must hold a file"
+    # The smallest stands in for a config file and the largest for weights,
+    # the one most likely to span several chunks.
+    for entry in {files[0].path: files[0], files[-1].path: files[-1]}.values():
+        file_ref = flat.version_ref.with_path(entry.path)
+        dest = tmp_path / entry.path.strip("/").replace("/", "_")
+        volumes.pull(file_ref, dest, strip_prefix=True)
+        pulled = (dest / entry.path.rsplit("/", 1)[-1]).read_bytes()
+
+        assert volumes.read_bytes(file_ref) == pulled
+        with volumes.open(file_ref) as source:
+            assert source.version_ref == flat.version_ref
+            streamed = b"".join(iter(lambda: source.read(1 << 20), b""))
+        assert streamed == pulled and len(pulled) == entry.size

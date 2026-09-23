@@ -1568,3 +1568,199 @@ def test_off_contract_inventory_is_a_protocol_error() -> None:
     services.versions = [api_version("b3:short")]
     with pytest.raises(VolumeProtocolError, match="unusable digest"):
         services.client().list_versions(VOLUME_REF)
+
+
+# --- single-file reads ------------------------------------------------------
+
+WEIGHTS = bytes(range(256)) * 64
+
+
+def chunk_requests(services: FakeServices) -> int:
+    """Object reads other than the manifest and chunkmaps."""
+    return sum(
+        1
+        for request in services.s3_requests()
+        if services.volume.objects[request.url.path.lstrip("/")][1].startswith(CHUNK)
+    )
+
+
+def test_read_bytes_and_text_return_one_verified_file_from_one_pinned_version() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    volumes = services.client()
+
+    assert volumes.read_bytes(f"{REF}/adapter/config.json") == b'{"r": 16}\n'
+    assert volumes.read_text(f"{REF}/adapter/config.json") == '{"r": 16}\n'
+    assert volumes.read_bytes(f"{REF}/adapter/weights.bin") == WEIGHTS
+    assert volumes.read_bytes(f"{REF}/adapter/hardlink-b") == b"shared inode\n"
+    assert len(services.resolve_requests()) == 4, "each read resolves once"
+
+    with volumes.open(f"{REF}/adapter/config.json") as source:
+        assert source.version_ref == pinned(services)
+        assert source.entry.path == "/adapter/config.json"
+        assert source.entry.size == 10 and source.entry.mode == 0o644
+        assert source.readable() and not source.seekable()
+
+
+def test_read_text_honors_encoding_and_errors() -> None:
+    services = FakeServices(build_volume({"latin.txt": File("café".encode("latin-1"))}))
+    volumes = services.client()
+
+    assert volumes.read_text(f"{REF}/latin.txt", encoding="latin-1") == "café"
+    assert volumes.read_text(f"{REF}/latin.txt", errors="replace") == "caf�"
+    with pytest.raises(UnicodeDecodeError):
+        volumes.read_text(f"{REF}/latin.txt")
+
+
+def test_open_streams_a_multi_chunk_file_in_order() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+
+    with services.client().open(f"{REF}/adapter/weights.bin") as source:
+        pieces = []
+        while piece := source.read(1000):
+            pieces.append(piece)
+        assert source.tell() == len(WEIGHTS)
+        assert source.read() == b"" and source.read1() == b""
+
+    assert b"".join(pieces) == WEIGHTS
+    assert [len(p) for p in pieces[:4]] == [1000, 1000, 1000, 1000], (
+        "a read spans chunk boundaries rather than stopping at them"
+    )
+    assert chunk_requests(services) == 6
+
+
+def test_open_supports_readinto_read1_and_readline_across_chunks() -> None:
+    text = b"".join(f"line {n}\n".encode() for n in range(20))
+    services = FakeServices(build_volume({"log.txt": File(text, chunk_size=5)}))
+    volumes = services.client()
+
+    with volumes.open(f"{REF}/log.txt") as source:
+        assert list(source) == text.splitlines(keepends=True)
+    with volumes.open(f"{REF}/log.txt") as source:
+        buffer = bytearray(12)
+        assert source.readinto(buffer) == 12 and bytes(buffer) == text[:12]
+        assert source.read1(100) == text[12:15], "read1 stops at the chunk's end"
+        assert source.readline() == b"ine 2\n"
+
+
+def test_open_bounds_the_chunks_it_fetches_ahead() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+
+    with services.client(max_bytes_in_flight=6000).open(
+        f"{REF}/adapter/weights.bin"
+    ) as source:
+        assert len(source._requested) == 1, "two copies of a 3000-byte chunk fill it"
+        assert source.read() == WEIGHTS
+
+    with services.client(max_bytes_in_flight=1).open(
+        f"{REF}/adapter/weights.bin"
+    ) as source:
+        assert len(source._requested) == 1, "a chunk over the bound is fetched alone"
+        assert source.read() == WEIGHTS
+
+
+def test_closing_a_stream_early_stops_fetching_and_keeps_the_client() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    volumes = services.client(max_bytes_in_flight=6000)
+
+    source = volumes.open(f"{REF}/adapter/weights.bin")
+    assert source.read(3000) == WEIGHTS[:3000]
+    source.close()
+
+    assert chunk_requests(services) <= 3, "chunks past the window are never read"
+    with pytest.raises(ValueError, match="closed"):
+        source.read()
+    assert volumes.read_bytes(f"{REF}/adapter/config.json") == b'{"r": 16}\n'
+
+
+def test_a_corrupt_chunk_raises_before_any_of_its_bytes_are_returned() -> None:
+    volume = build_volume(sample_tree())
+    fourth = WEIGHTS[9000:12000]
+    volume.objects[full_key(_s3.digest_of(fourth))] = (b"x" * 3000, CHUNK)
+    services = FakeServices(volume)
+
+    source = services.client().open(f"{REF}/adapter/weights.bin")
+    assert source.read(9000) == WEIGHTS[:9000]
+    with pytest.raises(VolumeIntegrityError, match="does not match"):
+        source.read(1)
+    assert source.closed, "a failed stream closes itself"
+
+    with pytest.raises(VolumeIntegrityError):
+        services.client().read_bytes(f"{REF}/adapter/weights.bin")
+
+
+def test_empty_files_read_without_an_object_read() -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    assert services.client().read_bytes(f"{REF}/adapter/empty.marker") == b""
+    assert chunk_requests(services) == 0
+
+
+def test_open_follows_symlinks_inside_the_version() -> None:
+    services = FakeServices(
+        build_volume(
+            {
+                **sample_tree(),
+                "alias": Symlink("adapter/sub"),
+                "chain": Symlink("adapter/latest"),
+            }
+        )
+    )
+    volumes = services.client()
+
+    assert volumes.read_bytes(f"{REF}/adapter/latest") == WEIGHTS
+    assert volumes.read_bytes(f"{REF}/adapter/abs") == b'{"r": 16}\n'
+    assert volumes.read_bytes(f"{REF}/alias/note.txt") == b"read-only dir child\n"
+    with volumes.open(f"{REF}/chain") as source:
+        assert source.entry.path == "/adapter/weights.bin"
+        assert source.read() == WEIGHTS
+
+
+@pytest.mark.parametrize(
+    ("tree", "path", "error", "match"),
+    [
+        (None, "adapter", VolumePathError, "is a directory"),
+        (None, "adapter/sub/", VolumePathError, "is a directory"),
+        (None, "adapter/missing", VolumePathError, "no file at /adapter/missing"),
+        (
+            {"a/b.txt": File(b"b")},
+            "a",
+            VolumePathError,
+            "/a is a directory",
+        ),
+        (
+            {"d": Dir(), "to-dir": Symlink("d")},
+            "to-dir",
+            VolumePathError,
+            r"/to-dir \(resolved to /d\) is a directory",
+        ),
+        (
+            {"dangling": Symlink("nowhere")},
+            "dangling",
+            VolumePathError,
+            r"no file at /dangling \(resolved to /nowhere\)",
+        ),
+        (
+            {"up": Symlink("../../etc/passwd")},
+            "up",
+            VolumePathError,
+            "escapes the volume root",
+        ),
+    ],
+)
+def test_open_refuses_what_is_not_one_file(
+    tree: dict[str, File | Dir | Symlink] | None,
+    path: str,
+    error: type[Exception],
+    match: str,
+) -> None:
+    services = FakeServices(build_volume(tree or sample_tree()))
+    with pytest.raises(error, match=match):
+        services.client().open(f"{REF}/{path}")
+    assert chunk_requests(services) == 0
+
+
+@pytest.mark.parametrize("ref", [REF, f"{REF}/", VOLUME_REF, f"bdn:{NAMESPACE}"])
+def test_open_needs_a_path_to_a_file(ref: str) -> None:
+    services = FakeServices(build_volume(sample_tree()))
+    with pytest.raises(VolumeRefError, match="names no file|names a namespace"):
+        services.client().read_bytes(ref)
+    assert services.requests == []
