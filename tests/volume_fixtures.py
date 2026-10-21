@@ -190,9 +190,57 @@ def s3_error(code: str) -> str:
     return f"<?xml version='1.0'?><Error><Code>{code}</Code><Message>{code}</Message></Error>"
 
 
+def api_version(digest: str, **overrides: Any) -> dict[str, Any]:
+    """A version as the Baseten API's version endpoints render one."""
+    return {
+        "namespace": NAMESPACE,
+        "volume": VOLUME,
+        "version_ref": f"bdn:{NAMESPACE}/{VOLUME}@{digest}",
+        "digest": digest,
+        "sequence": 7,
+        "lifecycle": "ALIVE",
+        "is_head": True,
+        "tags": ["step-100"],
+        "total_size_bytes": 1234,
+        "created_at": "2026-09-15T12:34:56Z",
+        "tombstoned_at": None,
+        "delete_after": None,
+        **overrides,
+    }
+
+
+def api_volume(name: str, head_digest: str | None, **overrides: Any) -> dict[str, Any]:
+    """A volume as the Baseten API's volume endpoints render one."""
+    head = (
+        None
+        if head_digest is None
+        else {
+            "digest": head_digest,
+            "total_size_bytes": 1234,
+            "created_at": "2026-09-15T12:34:56Z",
+        }
+    )
+    return {
+        "namespace": NAMESPACE,
+        "name": name,
+        "version_ref": f"bdn:{NAMESPACE}/{name}",
+        "sequence": 9,
+        "updated_at": "2026-09-16T00:00:00Z",
+        "head": head,
+        "tags": []
+        if head_digest is None
+        else [{"name": "step-100", "digest": head_digest}],
+        "tag_count": 0 if head_digest is None else 2,
+        "versions_alive": 3,
+        "versions_tombstoned": 1,
+        "versions_untagged": 1,
+        **overrides,
+    }
+
+
 @dataclass
 class FakeServices:
-    """Token endpoint, cannery resolve, and S3, all behind one MockTransport."""
+    """Baseten API volume endpoints, cannery resolve, and S3, all behind one MockTransport."""
 
     volume: Volume
     token_expires_in: dt.timedelta = dt.timedelta(hours=1)
@@ -207,12 +255,23 @@ class FakeServices:
     """Per-key (status, body) answers to give before serving the object."""
     requests: list[httpx.Request] = field(default_factory=list)
     resolve_count: int = 0
+    namespaces: list[str] = field(default_factory=lambda: [NAMESPACE])
+    volumes: list[dict[str, Any]] | None = None
+    """``GET /v1/volumes`` items; ``None`` lists one volume whose head is ``volume``."""
+    versions: list[dict[str, Any]] | None = None
+    """``GET .../versions`` items, tombstoned ones included; ``None`` is ``volume`` alone."""
+    page_size: int = 1000
+    """Items per page on the paginated listings, capped by the request's limit."""
+    api_error: tuple[int, Any] | None = None
+    """Answer for every Baseten API request other than the token mint."""
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         host = request.url.host
         if host == API_HOST:
-            return self._token(request)
+            if request.url.path == "/v1/volumes/token":
+                return self._token(request)
+            return self._inventory(request)
         if host == BDN_HOST:
             return self._resolve(request)
         if host == S3_HOST:
@@ -234,6 +293,76 @@ class FakeServices:
                 "namespaces": [NAMESPACE],
                 "volumes": [VOLUME],
                 "bdn_endpoint": self.bdn_endpoint,
+            },
+        )
+
+    def _inventory(self, request: httpx.Request) -> httpx.Response:
+        if self.api_error is not None:
+            status, body = self.api_error
+            return httpx.Response(status, json=body)
+        segments = request.url.path.removeprefix("/v1/volumes").strip("/").split("/")
+        match segments:
+            case ["namespaces"]:
+                return self._page(request, self.namespaces)
+            case [""]:
+                assert request.url.params["namespace"] == NAMESPACE
+                return self._page(request, self._volumes())
+            case [namespace, name] if (namespace, name) == (NAMESPACE, VOLUME):
+                return httpx.Response(200, json=self._volumes()[0])
+            case [namespace, name, "versions"] if (namespace, name) == (
+                NAMESPACE,
+                VOLUME,
+            ):
+                versions = self._versions()
+                if request.url.params.get("include_tombstoned") != "true":
+                    versions = [v for v in versions if v["lifecycle"] != "TOMBSTONED"]
+                return httpx.Response(
+                    200, json={"versions": versions, "volume_sequence": 9}
+                )
+            case [namespace, name, "versions", selector] if (namespace, name) == (
+                NAMESPACE,
+                VOLUME,
+            ):
+                for version in self._versions():
+                    if (
+                        selector == "head"
+                        and version["is_head"]
+                        or selector.startswith(":")
+                        and selector[1:] in version["tags"]
+                        or selector.startswith("@")
+                        and version["digest"]
+                        .removeprefix("b3:")
+                        .startswith(selector[1:].removeprefix("b3:"))
+                    ):
+                        return httpx.Response(
+                            200,
+                            json={**version, "entry_count": 10, "volume_sequence": 9},
+                        )
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    def _volumes(self) -> list[dict[str, Any]]:
+        if self.volumes is not None:
+            return self.volumes
+        return [api_volume(VOLUME, self.volume.manifest_digest)]
+
+    def _versions(self) -> list[dict[str, Any]]:
+        if self.versions is not None:
+            return self.versions
+        return [api_version(self.volume.manifest_digest)]
+
+    def _page(self, request: httpx.Request, items: list[Any]) -> httpx.Response:
+        start = int(request.url.params.get("cursor", "0"))
+        size = min(self.page_size, int(request.url.params["limit"]))
+        end = start + size
+        has_more = end < len(items)
+        return httpx.Response(
+            200,
+            json={
+                "items": items[start:end],
+                "pagination": {
+                    "has_more": has_more,
+                    "cursor": str(end) if has_more else None,
+                },
             },
         )
 
@@ -329,7 +458,18 @@ class FakeServices:
         return [request for request in self.requests if request.url.host == BDN_HOST]
 
     def token_requests(self) -> list[httpx.Request]:
-        return [request for request in self.requests if request.url.host == API_HOST]
+        return [
+            request
+            for request in self.requests
+            if request.url.host == API_HOST and request.url.path == "/v1/volumes/token"
+        ]
+
+    def inventory_requests(self) -> list[httpx.Request]:
+        return [
+            request
+            for request in self.requests
+            if request.url.host == API_HOST and request.url.path != "/v1/volumes/token"
+        ]
 
 
 def now() -> dt.datetime:

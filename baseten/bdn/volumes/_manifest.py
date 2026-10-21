@@ -428,6 +428,42 @@ def implicit_directories(paths: Iterable[str]) -> list[str]:
     return sorted(seen, key=lambda path: path.count("/"))
 
 
+def listed_entries(
+    entries: tuple[PathEntry, ...], path: str | None, *, recursive: bool
+) -> list[VolumeEntry]:
+    """The entries beneath ``path``: its immediate children, or every descendant with ``recursive``.
+
+    A child directory no record describes is synthesized from the paths
+    beneath it, since a version published before directory records were
+    required can describe one only that way. The recursive form synthesizes
+    nothing and lists what the version records.
+    """
+    root = (path or "").strip("/")
+    by_path = {entry.clean_path: entry for entry in entries}
+    at = by_path.get(root) if root else None
+    if at is not None and not isinstance(at, DirectoryEntry):
+        kind = _public_entry(at).kind
+        raise VolumePathError(f"/{root} is a {kind}, which has no entries beneath it")
+    prefix = f"{root}/" if root else ""
+    beneath = [entry for entry in entries if entry.clean_path.startswith(prefix)]
+    if root and at is None and not beneath:
+        raise VolumePathError(f"the version has no entry at /{root}")
+    if recursive:
+        beneath.sort(key=lambda entry: entry.clean_path.split("/"))
+        return [_public_entry(entry) for entry in beneath]
+    children: dict[str, VolumeEntry] = {}
+    for entry in beneath:
+        name, deeper, _ = entry.clean_path.removeprefix(prefix).partition("/")
+        if not deeper:
+            # A record for the directory itself replaces a synthesized one.
+            children[name] = _public_entry(entry)
+        elif name not in children:
+            children[name] = VolumeEntry(
+                path=f"/{prefix}{name}", kind=VolumeEntryKind.DIRECTORY
+            )
+    return sorted(children.values(), key=lambda entry: entry.path.split("/"))
+
+
 def select_paths(
     entries: tuple[PathEntry, ...], include: Sequence[str]
 ) -> set[str] | None:

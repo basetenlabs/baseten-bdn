@@ -1,6 +1,8 @@
-"""Client-side reads of BDN volumes: fetch a manifest, pull to a directory.
+"""Client-side reads of BDN volumes: list, describe, fetch a manifest, pull to a directory.
 
-The read path touches three services:
+Namespace and volume inventory, volume and version descriptions, and version
+history come from the Baseten API alone. Reading a version's content touches
+three services:
 
 1. The Baseten API mints a one-hour cannery token scoped to one volume
    (``POST /v1/volumes/token``), through baseten-python's ``ManagementClient``.
@@ -12,7 +14,9 @@ The read path touches three services:
 
 from __future__ import annotations
 
+import builtins
 import datetime as dt
+import functools
 import logging
 import secrets
 import shutil
@@ -23,10 +27,12 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, TypeVar
+from typing import Self, TypeVar, overload
 
 import httpx
+import pydantic
 from baseten.client import ManagementClient
+from baseten.client import managementapi as api
 from baseten.client.managementapi import (
     CreateVolumeTokenRequest,
     CreateVolumeTokenResponse,
@@ -42,6 +48,7 @@ from baseten.bdn.volumes._errors import (
     VolumeConnectionError,
     VolumeDestinationError,
     VolumeIntegrityError,
+    VolumeProtocolError,
     VolumeRefError,
     VolumeUnsupportedError,
 )
@@ -55,8 +62,18 @@ from baseten.bdn.volumes._manifest import (
     SymlinkEntry,
 )
 from baseten.bdn.volumes._models import (
+    NamespaceListing,
     PullResult,
+    Volume,
+    VolumeEntryListing,
+    VolumeHead,
+    VolumeListing,
     VolumeManifest,
+    VolumeNamespace,
+    VolumeTag,
+    VolumeVersion,
+    VolumeVersionDetail,
+    VolumeVersionListing,
 )
 from baseten.bdn.volumes._ref import VolumeRef, VolumeRefLevel
 
@@ -68,6 +85,8 @@ DEFAULT_MAX_BYTES_IN_FLIGHT = 1 << 30
 DEFAULT_REQUEST_TIMEOUT_SEC = 60.0
 
 _RESOLVE_PATH = "/v1/volumes/resolve"
+# The API's maximum, so a large inventory costs as few pages as possible.
+_PAGE_LIMIT = 1000
 # Tokens and STS sessions are re-minted this long before they expire, so an
 # in-flight request never presents a credential that lapses mid-request.
 _EXPIRY_MARGIN = dt.timedelta(minutes=5)
@@ -132,7 +151,8 @@ class VolumeClient:
         """Create a volume client.
 
         Args:
-            api_key: Baseten API key; used only to mint cannery tokens.
+            api_key: Baseten API key, for the Baseten API's volume endpoints
+                and the cannery tokens they mint.
             base_url_override: Baseten API base URL.
             bdn_endpoint_override: Cannery base URL, when not the one the
                 token response names.
@@ -143,7 +163,7 @@ class VolumeClient:
             http_client_override: Pre-configured httpx client for cannery and
                 the origin bucket; the caller owns its transport.
             management_client_override: Pre-configured baseten-python
-                :class:`ManagementClient` for the token mint; the caller owns
+                :class:`ManagementClient` for the Baseten API; the caller owns
                 its lifetime.
             close_http_client_on_close: Whether :meth:`close` closes the
                 clients. Defaults to ``True`` for clients created here and
@@ -200,19 +220,160 @@ class VolumeClient:
         it; ``entry_count`` and ``total_size`` still describe the whole version.
         """
         parsed = _volume_or_point(ref)
-        resolution = self._resolve(parsed)
-        store = self._object_store(parsed, resolution)
-        manifest = self._fetch_manifest(store, parsed, resolution)
+        version = self._open_version(parsed)
+        manifest = version.manifest
         paths = (
             _manifest.select_paths(manifest.entries, _ref_include(parsed))
             if parsed.path
             else None
         )
         return VolumeManifest(
-            version_ref=parsed.pinned(resolution.resolved.origin_digest),
+            version_ref=version.ref,
             entry_count=len(manifest.entries),
             total_size=manifest.header.total_size,
             entries=manifest.public_entries(paths),
+        )
+
+    @overload
+    def list(
+        self, ref: None = None, *, recursive: bool = False
+    ) -> NamespaceListing: ...
+
+    @overload
+    def list(
+        self, ref: str | VolumeRef, *, recursive: bool = False
+    ) -> NamespaceListing | VolumeListing | VolumeEntryListing: ...
+
+    def list(
+        self, ref: str | VolumeRef | None = None, *, recursive: bool = False
+    ) -> NamespaceListing | VolumeListing | VolumeEntryListing:
+        """List what ``ref`` names, dispatching on how much of a ref it is.
+
+        ============================  ==================================
+        ``ref``                       Result
+        ============================  ==================================
+        ``None`` or ``"bdn:"``        :class:`NamespaceListing`
+        ``bdn:ns``                    :class:`VolumeListing`
+        ``bdn:ns/vol``                entries at the root of the head
+        ``bdn:ns/vol:tag`` or ``@d``  entries at the root of that version
+        ``.../path``                  entries beneath that directory
+        ============================  ==================================
+
+        Entry listings are :class:`VolumeEntryListing` and hold a directory's
+        immediate children, or with ``recursive`` everything beneath it. A
+        head or tag is resolved once, and ``version_ref`` pins the version
+        that was listed. Namespace and volume listings walk every page.
+
+        Raises:
+            VolumeRefError: ``ref`` does not parse, or ``recursive`` was
+                passed for a namespace or volume inventory.
+            VolumePathError: The path names nothing in the version, or names
+                a file or symlink, which has no entries beneath it.
+            VolumeAPIError: The Baseten API or cannery rejected a request.
+        """
+        if ref is None or (isinstance(ref, str) and ref.strip() == "bdn:"):
+            _refuse_recursive_inventory(recursive, "namespaces")
+            return NamespaceListing(items=self._list_namespaces())
+        parsed = _parse(ref)
+        if parsed.level is VolumeRefLevel.NAMESPACE:
+            _refuse_recursive_inventory(recursive, f"the volumes in {parsed}")
+            return VolumeListing(
+                namespace=parsed.namespace, items=self._list_volumes(parsed.namespace)
+            )
+        version = self._open_version(parsed)
+        return VolumeEntryListing(
+            version_ref=version.ref,
+            items=_manifest.listed_entries(
+                version.manifest.entries, parsed.path, recursive=recursive
+            ),
+        )
+
+    def describe(self, ref: str | VolumeRef) -> Volume | VolumeVersionDetail:
+        """Describe a volume or one of its versions.
+
+        A volume ref (``bdn:ns/vol``) returns a :class:`Volume`; a tag or
+        digest ref returns a :class:`VolumeVersionDetail` whose
+        ``version_ref`` pins the version the tag pointed at when it was read.
+        Narrow the result on ``kind``: ``"volume"`` or ``"version"``.
+
+        Raises:
+            VolumeRefError: ``ref`` names a namespace or a path. Entry
+                metadata comes from :meth:`list` or :meth:`fetch_manifest`.
+            VolumeAPIError: The Baseten API rejected the request, including
+                ``status_code`` 404 for a volume or version that does not exist.
+        """
+        parsed = _parse(ref)
+        namespace, volume = parsed.namespace, parsed.volume
+        match parsed.level:
+            case VolumeRefLevel.NAMESPACE:
+                raise VolumeRefError(
+                    f"ref {parsed} names a namespace, which has nothing to describe; "
+                    f"list its volumes with list({str(parsed)!r})"
+                )
+            case VolumeRefLevel.PATH:
+                raise VolumeRefError(
+                    f"ref {parsed} names a path; describe() covers volumes and versions, "
+                    "and entry metadata comes from list() or fetch_manifest()"
+                )
+            case VolumeRefLevel.VOLUME:
+                assert volume is not None, "a volume-level ref names a volume"
+                return _volume(
+                    self._api(
+                        lambda: self._management_client.api.get_volumes_volume_name(
+                            volume_namespace=namespace, volume_name=volume
+                        )
+                    )
+                )
+            case VolumeRefLevel.POINT:
+                assert volume is not None, "a point-level ref names a volume"
+                selector = _version_selector(parsed)
+                detail = self._api(
+                    lambda: (
+                        self._management_client.api.get_volumes_versions_volume_version(
+                            volume_namespace=namespace,
+                            volume_name=volume,
+                            volume_version=selector,
+                        )
+                    )
+                )
+                return VolumeVersionDetail.model_validate(
+                    {**_version_fields(detail), "entry_count": detail.entry_count}
+                )
+        raise AssertionError(f"unhandled ref level {parsed.level}")
+
+    def list_versions(
+        self, ref: str | VolumeRef, *, include_tombstoned: bool = False
+    ) -> VolumeVersionListing:
+        """A volume's version history, newest first.
+
+        ``include_tombstoned`` adds deleted versions, whose ``lifecycle`` is
+        ``TOMBSTONED``; this client reads them and never restores them.
+
+        Raises:
+            VolumeRefError: ``ref`` does not name exactly a volume.
+            VolumeAPIError: The Baseten API rejected the request.
+        """
+        parsed = _parse(ref)
+        if parsed.level is not VolumeRefLevel.VOLUME:
+            raise VolumeRefError(
+                f"ref {parsed} names a {parsed.level}; version history belongs to a volume, "
+                f"so write 'bdn:{parsed.namespace}/{parsed.volume or '<volume>'}'"
+            )
+        namespace, volume = parsed.namespace, parsed.volume
+        assert volume is not None, "a volume-level ref names a volume"
+        request = api.GetVolumesVersionsRequest(include_tombstoned=include_tombstoned)
+        # Unpaged upstream: one response carries the whole history.
+        response = self._api(
+            lambda: self._management_client.api.get_volumes_versions(
+                volume_namespace=namespace, volume_name=volume, request=request
+            )
+        )
+        return VolumeVersionListing(
+            volume_ref=parsed,
+            items=[
+                VolumeVersion.model_validate(_version_fields(v))
+                for v in response.versions
+            ],
         )
 
     def pull(
@@ -259,10 +420,8 @@ class VolumeClient:
         parsed = _volume_or_point(ref)
         dest = Path(dest_dir)
         _check_destination(dest, overwrite)
-        resolution = self._resolve(parsed)
-        version_ref = parsed.pinned(resolution.resolved.origin_digest)
-        store = self._object_store(parsed, resolution)
-        manifest = self._fetch_manifest(store, parsed, resolution)
+        version = self._open_version(parsed)
+        version_ref, manifest = version.ref, version.manifest
         contained = _manifest.ContainedPaths(manifest.entries)
         selected = _manifest.select_paths(
             manifest.entries, [*_ref_include(parsed), *include]
@@ -280,9 +439,7 @@ class VolumeClient:
         root = staging or dest
         try:
             root.mkdir(parents=True, exist_ok=True)
-            materializer = _Materializer(
-                store, parsed, resolution, root, contained, self._options
-            )
+            materializer = _Materializer(version, root, contained, self._options)
             written, file_count = materializer.run(manifest, selected)
             if staging is not None:
                 if dest.exists():
@@ -400,6 +557,61 @@ class VolumeClient:
             time.sleep(_s3.backoff_sec(attempt))
         raise AssertionError("unreachable: the retry loop returns or raises")
 
+    def _api(self, call: Callable[[], _T]) -> _T:
+        """One read against the Baseten API, retried and translated into volume errors."""
+        try:
+            return self._with_retry("Baseten API", call)
+        # The generated client raises ValueError for a non-JSON body and
+        # ValidationError for JSON that does not match its models.
+        except (pydantic.ValidationError, ValueError) as error:
+            raise VolumeProtocolError(
+                f"Baseten API response is off contract: {error}"
+            ) from error
+
+    # builtins.list: the list() method shadows the builtin in this class body.
+    def _list_namespaces(self) -> builtins.list[VolumeNamespace]:
+        items: list[VolumeNamespace] = []
+        request = api.GetVolumesNamespacesRequest(limit=_PAGE_LIMIT)
+        while True:
+            page = self._api(
+                functools.partial(
+                    self._management_client.api.get_volumes_namespaces, request=request
+                )
+            )
+            items.extend(VolumeNamespace(name=name) for name in page.items)
+            if not page.pagination.has_more or page.pagination.cursor is None:
+                return items
+            request = api.GetVolumesNamespacesRequest(
+                limit=_PAGE_LIMIT, cursor=page.pagination.cursor
+            )
+
+    def _list_volumes(self, namespace: str) -> builtins.list[Volume]:
+        items: list[Volume] = []
+        request = api.GetVolumesRequest(namespace=namespace, limit=_PAGE_LIMIT)
+        while True:
+            page = self._api(
+                functools.partial(
+                    self._management_client.api.get_volumes, request=request
+                )
+            )
+            items.extend(_volume(volume) for volume in page.items)
+            if not page.pagination.has_more or page.pagination.cursor is None:
+                return items
+            request = api.GetVolumesRequest(
+                namespace=namespace, limit=_PAGE_LIMIT, cursor=page.pagination.cursor
+            )
+
+    def _open_version(self, ref: VolumeRef) -> _Version:
+        """Resolve ``ref`` once and read the manifest of the version it names."""
+        resolution = self._resolve(ref)
+        store = self._object_store(ref, resolution)
+        return _Version(
+            ref=ref.pinned(resolution.resolved.origin_digest),
+            org_id=resolution.resolved.org_id,
+            store=store,
+            manifest=self._fetch_manifest(store, ref, resolution),
+        )
+
     def _object_store(self, ref: VolumeRef, first: ResolveResponse) -> _s3.ObjectStore:
         # Refreshes re-resolve the pinned digest, never the tag: the tag may
         # have moved or vanished while this version is still being read.
@@ -420,6 +632,21 @@ class VolumeClient:
             expected_digest=resolved.origin_digest,
         )
         return _manifest.parse_manifest(data)
+
+
+@dataclass(frozen=True)
+class _Version:
+    """One resolved version: its pin, where its objects live, and its manifest."""
+
+    ref: VolumeRef
+    """The volume pinned to this version, with no path."""
+
+    org_id: str
+    store: _s3.ObjectStore
+    manifest: Manifest
+
+    def key(self, relative_key: str) -> str:
+        return _object_key(self.org_id, self.ref.namespace, relative_key)
 
 
 class _CredentialSource:
@@ -452,16 +679,13 @@ class _Materializer:
 
     def __init__(
         self,
-        store: _s3.ObjectStore,
-        ref: VolumeRef,
-        resolution: ResolveResponse,
+        version: _Version,
         root: Path,
         contained: _manifest.ContainedPaths,
         options: VolumeClientOptions,
     ) -> None:
-        self._store = store
-        self._namespace = ref.namespace
-        self._org_id = resolution.resolved.org_id
+        self._version = version
+        self._store = version.store
         self._root = root
         self._contained = contained
         self._options = options
@@ -570,11 +794,15 @@ class _Materializer:
             self._budget.release(charge)
 
     def _key(self, relative_key: str) -> str:
-        return _object_key(self._org_id, self._namespace, relative_key)
+        return self._version.key(relative_key)
+
+
+def _parse(ref: str | VolumeRef) -> VolumeRef:
+    return VolumeRef.parse(ref) if isinstance(ref, str) else ref
 
 
 def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
-    parsed = VolumeRef.parse(ref) if isinstance(ref, str) else ref
+    parsed = _parse(ref)
     if parsed.level is VolumeRefLevel.NAMESPACE:
         raise VolumeRefError(
             f"ref {parsed} names a namespace; this operation needs a volume"
@@ -585,6 +813,71 @@ def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
 def _ref_include(ref: VolumeRef) -> list[str]:
     """A ref path narrows exactly as an include entry would; ``/`` narrows nothing."""
     return [ref.path.removeprefix("/")] if ref.path and ref.path != "/" else []
+
+
+def _refuse_recursive_inventory(recursive: bool, what: str) -> None:
+    if recursive:
+        raise VolumeRefError(
+            f"recursive=True lists entries within a version; listing {what} takes no recursion"
+        )
+
+
+def _version_selector(ref: VolumeRef) -> str:
+    """The version ``ref`` selects, spelled the way the API's path segment takes it."""
+    if ref.digest is not None:
+        return f"@{ref.digest}"
+    if ref.tag is not None:
+        return f":{ref.tag}"
+    return "head"
+
+
+def _pinned_ref(namespace: str, volume: str, digest: str) -> VolumeRef:
+    try:
+        return VolumeRef(namespace=namespace, volume=volume).pinned(digest)
+    except VolumeRefError as error:
+        raise VolumeProtocolError(
+            f"Baseten API returned an unusable digest: {error}"
+        ) from error
+
+
+def _volume(volume: api.Volume) -> Volume:
+    head = volume.head
+    return Volume(
+        ref=VolumeRef(namespace=volume.namespace, volume=volume.name),
+        sequence=volume.sequence,
+        updated_at=volume.updated_at,
+        head=None
+        if head is None
+        else VolumeHead(
+            version_ref=_pinned_ref(volume.namespace, volume.name, head.digest),
+            digest=head.digest,
+            total_size=head.total_size_bytes,
+            created_at=head.created_at,
+        ),
+        tags=[VolumeTag(name=tag.name, digest=tag.digest) for tag in volume.tags],
+        tag_count=volume.tag_count,
+        versions_alive=volume.versions_alive,
+        versions_tombstoned=volume.versions_tombstoned,
+        versions_untagged=volume.versions_untagged,
+    )
+
+
+def _version_fields(
+    version: api.VolumeVersion | api.VolumeVersionDetail,
+) -> dict[str, object]:
+    """The fields :class:`VolumeVersion` shares with :class:`VolumeVersionDetail`."""
+    return {
+        "version_ref": _pinned_ref(version.namespace, version.volume, version.digest),
+        "digest": version.digest,
+        "sequence": version.sequence,
+        "lifecycle": version.lifecycle,
+        "is_head": version.is_head,
+        "tags": version.tags,
+        "total_size": version.total_size_bytes,
+        "created_at": version.created_at,
+        "tombstoned_at": version.tombstoned_at,
+        "delete_after": version.delete_after,
+    }
 
 
 def _object_key(org_id: str, namespace: str, relative_key: str) -> str:
