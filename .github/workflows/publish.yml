@@ -17,4 +17,4 @@ jobs:
 
       - run: uv build
 
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: chainguard-actions/pypa-gh-action-pypi-publish@63fe61429e914c1fdc8cd577c8b8b695f108268b # v1.14.2
