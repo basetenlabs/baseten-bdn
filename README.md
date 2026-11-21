@@ -55,9 +55,23 @@ with HotLoadClient() as hotload:
 load_adapter(adapter.path)  # /bdn/mounts/sql-lora
 ```
 
+To serve another version of the same volume at the same path, attach again on
+the same target. The attachment keeps its id and path, the directory is never
+empty in between, and files already open keep reading the version they were
+opened on.
+
+```python
+    adapter = hotload.attach("bdn:adapters/sql-lora:v2", target="sql-lora")
+```
+
+A tag is resolved again on every attach, so repeating the same ref follows a
+tag that has moved. `pinned_source` on the result says which version is being
+served. Attaching another volume, or other filters, on a held target is
+refused with `TARGET_IN_USE`.
+
 `AsyncHotLoadClient` offers the same methods as coroutines. Attachments belong
 to the pod and stay mounted after the client is closed; call `detach` to free a
-target name for reuse.
+target name for another volume.
 
 ## Development
 

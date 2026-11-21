@@ -12,6 +12,11 @@ Wire contract (HTTP+JSON over the socket):
   "exclude"?}`` and a required ``Idempotency-Key`` header answers ``202`` with
   the attachment. The same key with the same body replays the stored
   attachment; the same key with a different body is ``409``.
+* A ``POST`` on a target the pod already holds, with another ref of the same
+  volume and the same filters, moves that attachment to the version the ref
+  names and answers with it: same ``id`` and ``path``, new ``pinned_source``.
+  Anything else on a held target is ``409 TARGET_IN_USE``. ``409
+  SWAP_IN_FLIGHT`` (retryable) means the move is still coming up.
 * ``GET /v1/hotload/volumes`` answers ``{"volumes": [...]}``.
 * ``GET`` / ``DELETE /v1/hotload/volumes/{id}`` read or detach one attachment.
 * ``GET /healthz`` answers ``204``.
@@ -71,6 +76,11 @@ _INTERRUPTED_HINT = (
     " retrying."
 )
 
+# The daemon answers a move to another version this way when its own wait ran
+# out with the version still coming up; the same request answers once it has.
+_IN_FLIGHT_CODE = "SWAP_IN_FLIGHT"
+_IN_FLIGHT_POLL_INTERVAL_SEC = 1.0
+
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
@@ -84,7 +94,9 @@ class HotLoadClientOptions:
     request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC
     """Bound on one attach or detach. An attach resolves the source, acquires
     the shared view, and binds it before answering, so this bounds a cold
-    attach, not a round trip. Reads use a short fixed bound."""
+    attach, not a round trip. It also bounds how long an attach keeps asking
+    while a move to another version is still in flight. Reads use a short
+    fixed bound."""
 
     max_retries: int = DEFAULT_MAX_RETRIES
     """Retries after the first attempt, for failures that are safe to repeat."""
@@ -176,20 +188,32 @@ class HotLoadClient:
         Each call mints one idempotency key and reuses it across its own
         retries, so a retried request cannot attach the same volume twice.
 
+        If this pod already holds *target* with an attachment of the same
+        volume and the same filters, the call moves that attachment to the
+        version *source* names instead of failing. The attachment keeps its
+        ``id`` and ``path``, and the directory is never empty in between.
+        Files already open keep reading the version they were opened on.
+        A tag is resolved again on every call, so repeating the same *source*
+        follows a tag that has moved. Compare ``pinned_source`` before and
+        after to see whether the version changed.
+
         Args:
             source: A BDN volume ref, ``bdn:<namespace>/<volume>`` optionally
                 pinned with ``@<digest>`` or ``:<tag>``. Paths inside a volume
                 are not accepted; narrow with *include* instead.
             target: One directory name below ``/bdn/mounts``: letters, digits,
                 ``.``, ``_``, ``-``, starting alphanumeric, at most 128 bytes.
-                Each name can hold one attachment at a time.
+                Each name holds one attachment at a time.
             include: Glob filters selecting the files to materialize.
             exclude: Glob filters removing files from the selection.
 
         Raises:
             HotLoadAttachError: The daemon answered with a ``FAILED``
                 attachment, which still holds the target; detach it first.
-            HotLoadAPIError: The daemon rejected the request.
+            HotLoadAPIError: The daemon rejected the request. On a held
+                target, ``TARGET_IN_USE`` means *source* names another volume
+                or the filters differ; detach first. ``SWAP_IN_FLIGHT`` means
+                a move was still coming up when the request timeout ran out.
             HotLoadTimeoutError: No answer within the request timeout. The
                 attach may have completed or been abandoned on the node;
                 check :meth:`list_attachments`.
@@ -255,7 +279,10 @@ class HotLoadClient:
     ) -> bytes:
         attempts = _attempts(self._options, max_retries)
         timeout = _timeout(self._options, timeout_sec)
-        for attempt in range(1, attempts + 1):
+        in_flight_deadline = time.monotonic() + self._options.request_timeout_sec
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 response = self._http_client.request(
                     method, path, json=json, headers=headers, timeout=timeout
@@ -267,10 +294,15 @@ class HotLoadClient:
                         error, method, self._options.socket_path
                     ) from error
             except HotLoadAPIError as error:
+                if _still_in_flight(error):
+                    if time.monotonic() >= in_flight_deadline:
+                        raise
+                    attempt -= 1
+                    time.sleep(_IN_FLIGHT_POLL_INTERVAL_SEC)
+                    continue
                 if attempt == attempts or not error.retryable:
                     raise
             time.sleep(self._options.retry_interval_sec)
-        raise AssertionError("unreachable: the retry loop returns or raises")
 
 
 class AsyncHotLoadClient:
@@ -387,7 +419,10 @@ class AsyncHotLoadClient:
     ) -> bytes:
         attempts = _attempts(self._options, max_retries)
         timeout = _timeout(self._options, timeout_sec)
-        for attempt in range(1, attempts + 1):
+        in_flight_deadline = time.monotonic() + self._options.request_timeout_sec
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 response = await self._http_client.request(
                     method, path, json=json, headers=headers, timeout=timeout
@@ -399,10 +434,15 @@ class AsyncHotLoadClient:
                         error, method, self._options.socket_path
                     ) from error
             except HotLoadAPIError as error:
+                if _still_in_flight(error):
+                    if time.monotonic() >= in_flight_deadline:
+                        raise
+                    attempt -= 1
+                    await asyncio.sleep(_IN_FLIGHT_POLL_INTERVAL_SEC)
+                    continue
                 if attempt == attempts or not error.retryable:
                     raise
             await asyncio.sleep(self._options.retry_interval_sec)
-        raise AssertionError("unreachable: the retry loop returns or raises")
 
 
 class _AttachmentList(BaseModel):
@@ -480,6 +520,10 @@ def _retry_http_error(error: httpx.HTTPError, method: str) -> bool:
     if not isinstance(error, httpx.TransportError):
         return False
     return _never_sent(error) or method == "GET"
+
+
+def _still_in_flight(error: HotLoadAPIError) -> bool:
+    return error.retryable and error.code == _IN_FLIGHT_CODE
 
 
 def _http_failure(
