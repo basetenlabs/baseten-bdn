@@ -472,3 +472,96 @@ async def test_async_list_and_health() -> None:
     assert await client.healthy() is False
     assert len(fake.requests) == 2
     await client.close()
+
+
+SWAP_IN_FLIGHT = Reply(
+    409,
+    {
+        "code": "SWAP_IN_FLIGHT",
+        "message": f"Hot Load attachment {ATTACHMENT_ID} is still being moved to the version last asked for",
+        "retryable": True,
+    },
+)
+TARGET_IN_USE = Reply(
+    409,
+    {
+        "code": "TARGET_IN_USE",
+        "message": 'Hot Load target "probe" is already in use',
+        "retryable": False,
+    },
+)
+MOVED_PINNED = "bdn:hotload-smoke/fixture@b3:" + "f" * 64
+MOVED_ATTACHMENT = {
+    **READY_ATTACHMENT,
+    "revision": 4,
+    "source": f"{SOURCE}:v2",
+    "pinned_source": MOVED_PINNED,
+}
+
+
+@pytest.fixture
+def no_in_flight_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("baseten.bdn.hotload._client._IN_FLIGHT_POLL_INTERVAL_SEC", 0)
+
+
+def test_attach_on_a_held_target_returns_the_moved_attachment() -> None:
+    fake = FakeTransport([Reply(202, READY_ATTACHMENT), Reply(202, MOVED_ATTACHMENT)])
+    client = sync_client(fake)
+
+    first = client.attach(SOURCE, target="probe")
+    moved = client.attach(f"{SOURCE}:v2", target="probe")
+
+    assert (moved.id, moved.path) == (first.id, first.path)
+    assert moved.pinned_source == MOVED_PINNED != first.pinned_source
+    assert fake.requests[1].body == {"source": f"{SOURCE}:v2", "target": "probe"}
+
+
+def test_attach_waits_out_a_move_in_flight_beyond_max_retries(
+    no_in_flight_pause: None,
+) -> None:
+    fake = FakeTransport([SWAP_IN_FLIGHT] * 5 + [Reply(202, MOVED_ATTACHMENT)])
+
+    moved = sync_client(fake, max_retries=0).attach(f"{SOURCE}:v2", target="probe")
+
+    assert moved.pinned_source == MOVED_PINNED
+    keys = {request.headers["idempotency-key"] for request in fake.requests}
+    assert len(fake.requests) == 6 and len(keys) == 1
+
+
+def test_attach_stops_waiting_for_a_move_at_the_request_timeout(
+    no_in_flight_pause: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([0.0, 1.0, 2.0, 3.0])
+    monkeypatch.setattr(
+        "baseten.bdn.hotload._client.time.monotonic", lambda: next(clock)
+    )
+    fake = FakeTransport([SWAP_IN_FLIGHT])
+
+    with pytest.raises(HotLoadAPIError) as raised:
+        sync_client(fake, request_timeout_sec=2.5).attach(SOURCE, target="probe")
+
+    assert raised.value.code == "SWAP_IN_FLIGHT"
+    assert len(fake.requests) == 3
+
+
+def test_attach_does_not_retry_a_target_held_otherwise() -> None:
+    fake = FakeTransport([TARGET_IN_USE])
+
+    with pytest.raises(HotLoadAPIError) as raised:
+        sync_client(fake).attach("bdn:hotload-smoke/other", target="probe")
+
+    assert raised.value.code == "TARGET_IN_USE"
+    assert len(fake.requests) == 1
+
+
+async def test_async_attach_waits_out_a_move_in_flight(
+    no_in_flight_pause: None,
+) -> None:
+    fake = FakeTransport([SWAP_IN_FLIGHT] * 4 + [Reply(202, MOVED_ATTACHMENT)])
+
+    moved = await async_client(fake, max_retries=0).attach(
+        f"{SOURCE}:v2", target="probe"
+    )
+
+    assert moved.pinned_source == MOVED_PINNED
+    assert len(fake.requests) == 5
