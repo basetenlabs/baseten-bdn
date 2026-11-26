@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+from baseten.client import AccessToken, AccessTokenOptions
 
 from baseten.bdn.volumes import (
     VolumeAPIError,
@@ -35,6 +36,7 @@ from baseten.bdn.volumes import (
 from baseten.bdn.volumes._cannery import OriginCredentials
 from baseten.bdn.volumes._materialize import ByteBudget
 from tests.volume_fixtures import (
+    API_HOST,
     API_KEY,
     CANNERY_TOKEN,
     CHUNK,
@@ -824,6 +826,138 @@ def test_expired_token_is_minted_again() -> None:
     volumes.fetch_manifest(REF)
     volumes.fetch_manifest(REF)
     assert len(services.token_requests()) == 2
+
+
+class _CountingCredentials:
+    """Returns a new short-lived Baseten token on every call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def access_token(self, options: AccessTokenOptions) -> AccessToken:
+        self.calls += 1
+        return AccessToken(
+            token=f"baseten-token-{self.calls}",
+            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(minutes=10),
+        )
+
+
+def test_credentials_mint_each_volume_token_with_a_new_baseten_token() -> None:
+    services = FakeServices(build_volume({}), token_expires_in=dt.timedelta(minutes=4))
+    volumes = VolumeClient(
+        base_url_override=f"https://{API_HOST}",
+        http_client_override=services.http_client(),
+        management_client_override=services.management_client(_CountingCredentials()),
+    )
+    volumes.fetch_manifest(REF)
+    volumes.fetch_manifest(REF)
+    assert [
+        request.headers["authorization"] for request in services.token_requests()
+    ] == ["Bearer baseten-token-1", "Bearer baseten-token-2"]
+
+
+def test_token_function_is_asked_for_every_token() -> None:
+    tokens = iter(["baseten-token-1", "baseten-token-2"])
+    volumes = VolumeClient(api_key=lambda: next(tokens))
+    try:
+        credentials = volumes.management_client.options.credentials
+        assert credentials is not None
+        assert [
+            credentials.access_token(AccessTokenOptions()).token for _ in range(2)
+        ] == ["baseten-token-1", "baseten-token-2"]
+    finally:
+        volumes.close()
+
+
+class _ReplacingCredentials:
+    """Keeps one Baseten token until it is refused, then returns a new one."""
+
+    def __init__(self) -> None:
+        self.generation = 1
+
+    def access_token(self, options: AccessTokenOptions) -> AccessToken:
+        if options.refused_token == self._current():
+            self.generation += 1
+        return AccessToken(
+            token=self._current(),
+            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(minutes=10),
+        )
+
+    def _current(self) -> str:
+        return f"baseten-token-{self.generation}"
+
+
+def test_a_refused_access_token_is_replaced_and_the_mint_retried_once() -> None:
+    services = FakeServices(build_volume({}), token_refusals=1)
+    volumes = VolumeClient(
+        base_url_override=f"https://{API_HOST}",
+        http_client_override=services.http_client(),
+        management_client_override=services.management_client(_ReplacingCredentials()),
+    )
+    volumes.fetch_manifest(REF)
+    assert [
+        request.headers["authorization"] for request in services.token_requests()
+    ] == ["Bearer baseten-token-1", "Bearer baseten-token-2"]
+
+
+def test_a_mint_refused_twice_fails() -> None:
+    services = FakeServices(build_volume({}), token_refusals=3)
+    with pytest.raises(VolumeAPIError) as raised:
+        services.client().fetch_manifest(REF)
+    assert (raised.value.service, raised.value.status_code) == ("Baseten API", 401)
+    assert len(services.token_requests()) == 2
+
+
+class _InvalidatableTokenFunction:
+    def __init__(self) -> None:
+        self.invalidated: list[str] = []
+
+    def __call__(self) -> str:
+        return "baseten-token-1"
+
+    def invalidate(self, token: str) -> None:
+        self.invalidated.append(token)
+
+
+def test_token_function_is_told_about_a_refused_token() -> None:
+    function = _InvalidatableTokenFunction()
+    volumes = VolumeClient(api_key=function)
+    try:
+        credentials = volumes.management_client.options.credentials
+        assert credentials is not None
+        credentials.access_token(AccessTokenOptions())
+        credentials.access_token(AccessTokenOptions(refused_token="baseten-token-1"))
+        assert function.invalidated == ["baseten-token-1"]
+    finally:
+        volumes.close()
+
+
+def test_default_client_sends_the_given_credentials() -> None:
+    credentials = _CountingCredentials()
+    volumes = VolumeClient(credentials=credentials)
+    try:
+        assert volumes.management_client.options.credentials is credentials
+        assert volumes.options.api_key is None
+    finally:
+        volumes.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({}, "one of api_key or credentials"),
+        ({"api_key": "k", "credentials": _CountingCredentials()}, "mutually exclusive"),
+        (
+            {"api_key": lambda: "k", "credentials": _CountingCredentials()},
+            "mutually exclusive",
+        ),
+    ],
+)
+def test_client_takes_exactly_one_of_api_key_and_credentials(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        VolumeClient(**kwargs)
 
 
 def test_token_mint_retries_transient_errors_and_reports_rejections() -> None:

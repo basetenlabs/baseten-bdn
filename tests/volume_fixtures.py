@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-from baseten.client import ManagementClient
+from baseten.client import Credentials, ManagementClient
 
 from baseten.bdn.volumes import VolumeClient
 from baseten.bdn.volumes._s3 import digest_of, zstd
@@ -202,6 +202,8 @@ class FakeServices:
     """Status codes to answer resolve with before answering normally."""
     token_error: tuple[int, Any] | None = None
     token_failures: list[int] = field(default_factory=list)
+    token_refusals: int = 0
+    """Mints to refuse as Baseten refuses an access token, before answering normally."""
     bdn_endpoint: str | None = f"https://{BDN_HOST}"
     s3_failures: dict[str, list[tuple[int, str]]] = field(default_factory=dict)
     """Per-key (status, body) answers to give before serving the object."""
@@ -220,6 +222,15 @@ class FakeServices:
         return httpx.Response(500, text=f"unexpected host {host}")
 
     def _token(self, request: httpx.Request) -> httpx.Response:
+        if self.token_refusals:
+            self.token_refusals -= 1
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": 'Bearer realm="baseten", error="invalid_token"'
+                },
+                json={"code": "UNAUTHENTICATED", "message": "token refused"},
+            )
         if self.token_failures:
             return httpx.Response(self.token_failures.pop(0), text="upstream hiccup")
         if self.token_error is not None:
@@ -299,17 +310,25 @@ class FakeServices:
     def http_client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.handle))
 
-    def management_client(self) -> ManagementClient:
+    def management_client(
+        self, credentials: Credentials | None = None
+    ) -> ManagementClient:
         # The generated client posts relative paths, so its own httpx client
-        # carries the base URL and the bearer header, as ManagementClient
-        # would set them for a client it builds itself.
+        # carries the base URL and, for an API key, the bearer header, as
+        # ManagementClient would set them for a client it builds itself.
+        # Credentials set the header on each request instead.
         return ManagementClient(
-            api_key=API_KEY,
+            api_key=None if credentials is not None else API_KEY,
+            credentials=credentials,
             base_url_override=f"https://{API_HOST}",
             http_client_override=httpx.Client(
                 transport=httpx.MockTransport(self.handle),
                 base_url=f"https://{API_HOST}",
-                headers={"Authorization": f"Bearer {API_KEY}"},
+                headers=(
+                    {}
+                    if credentials is not None
+                    else {"Authorization": f"Bearer {API_KEY}"}
+                ),
             ),
         )
 

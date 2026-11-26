@@ -23,15 +23,19 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, TypeVar
+from typing import Protocol, Self, TypeVar, runtime_checkable
 
 import httpx
-from baseten.client import ManagementClient
+from baseten.client import (
+    AccessToken,
+    AccessTokenOptions,
+    Credentials,
+    ManagementClient,
+)
 from baseten.client.managementapi import (
     CreateVolumeTokenRequest,
     CreateVolumeTokenResponse,
     ResponseError,
-    VolumeTokenScope,
 )
 
 from baseten.bdn._useragent import user_agent
@@ -78,7 +82,9 @@ _CONNECT_TIMEOUT_SEC = 10.0
 class VolumeClientOptions:
     """Options for :class:`VolumeClient`."""
 
-    api_key: str
+    api_key: str | Callable[[], str] | None = None
+    """Baseten API key, or a function that returns a current Baseten token."""
+
     base_url_override: str | None = None
     """Baseten API base URL; ``None`` means the public API."""
 
@@ -94,8 +100,11 @@ class VolumeClientOptions:
     request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC
     """Read bound on one HTTP request to cannery or the origin bucket."""
 
+    credentials: Credentials | None = None
+    """Supplies short-lived Baseten tokens in place of ``api_key``."""
+
     def __post_init__(self) -> None:
-        if not self.api_key:
+        if self.api_key == "":
             raise ValueError("api_key must not be empty")
         if self.max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
@@ -111,7 +120,7 @@ class VolumeClientOptions:
 
 
 class VolumeClient:
-    """Synchronous client for reading BDN volumes from anywhere with a Baseten API key.
+    """Synchronous client for reading BDN volumes from anywhere with Baseten credentials.
 
     Usable as a context manager; exiting closes the HTTP clients this object owns.
     """
@@ -119,7 +128,8 @@ class VolumeClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: str | Callable[[], str] | None = None,
+        credentials: Credentials | None = None,
         base_url_override: str | None = None,
         bdn_endpoint_override: str | None = None,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
@@ -132,7 +142,16 @@ class VolumeClient:
         """Create a volume client.
 
         Args:
-            api_key: Baseten API key; used only to mint cannery tokens.
+            api_key: Baseten API key, or a function that returns a current
+                Baseten token; used only to mint cannery tokens. A function is
+                called for every mint, so a pull can outlast one short-lived
+                token. If it also has an ``invalidate(token)`` method, that is
+                called with a token Baseten refused.
+            credentials: Supplies short-lived Baseten tokens in place of
+                ``api_key``, such as baseten-python's
+                ``WorkloadIdentityCredentials``. A token is fetched for every
+                mint. Exactly one of ``api_key`` and ``credentials`` is
+                required, unless ``management_client_override`` is given.
             base_url_override: Baseten API base URL.
             bdn_endpoint_override: Cannery base URL, when not the one the
                 token response names.
@@ -156,6 +175,7 @@ class VolumeClient:
             max_concurrency=max_concurrency,
             max_bytes_in_flight=max_bytes_in_flight,
             request_timeout_sec=request_timeout_sec,
+            credentials=credentials,
         )
         self._timeout = httpx.Timeout(request_timeout_sec, connect=_CONNECT_TIMEOUT_SEC)
         self._owns_http_client = http_client_override is None
@@ -166,7 +186,7 @@ class VolumeClient:
         )
         self._owns_management_client = management_client_override is None
         self._management_client = (
-            ManagementClient(api_key=api_key, base_url_override=base_url_override)
+            _management_client(api_key, credentials, base_url_override)
             if management_client_override is None
             else management_client_override
         )
@@ -334,14 +354,22 @@ class VolumeClient:
             if cached is not None and cached.expires_at - _now() > _EXPIRY_MARGIN:
                 return cached
             request = CreateVolumeTokenRequest(
-                scopes=[VolumeTokenScope.PULL],
+                scopes=["PULL"],
                 namespaces=[ref.namespace],
                 volumes=[ref.volume],
             )
-            token = self._with_retry(
-                "Baseten API",
-                lambda: self._management_client.api.post_volumes_token(request=request),
-            )
+
+            def mint() -> CreateVolumeTokenResponse:
+                return self._management_client.api.post_volumes_token(request=request)
+
+            try:
+                token = self._with_retry("Baseten API", mint)
+            except VolumeAPIError as error:
+                if error.status_code != 401:
+                    raise
+                # Baseten refused the access token. Credentials replace a refused
+                # token on the next request, so one more mint can succeed.
+                token = self._with_retry("Baseten API", mint)
             self._tokens[key] = token
             return token
 
@@ -571,6 +599,50 @@ class _Materializer:
 
     def _key(self, relative_key: str) -> str:
         return _object_key(self._org_id, self._namespace, relative_key)
+
+
+@runtime_checkable
+class _RefusableTokenFunction(Protocol):
+    def __call__(self) -> str: ...
+
+    def invalidate(self, token: str) -> None: ...
+
+
+class _TokenFunctionCredentials:
+    """Credentials that ask a token function for every request.
+
+    The function caches and refreshes its own tokens, so each token is reported
+    as expiring now and nothing here holds on to it. A function with an
+    ``invalidate(token)`` method is told about a token Baseten refused, so it
+    returns a new one.
+    """
+
+    def __init__(self, token: Callable[[], str]) -> None:
+        self._token = token
+
+    def access_token(self, options: AccessTokenOptions) -> AccessToken:
+        if options.refused_token is not None and isinstance(
+            self._token, _RefusableTokenFunction
+        ):
+            self._token.invalidate(options.refused_token)
+        return AccessToken(token=self._token(), expires_at=_now())
+
+
+def _management_client(
+    api_key: str | Callable[[], str] | None,
+    credentials: Credentials | None,
+    base_url_override: str | None,
+) -> ManagementClient:
+    if callable(api_key):
+        if credentials is not None:
+            raise ValueError("api_key and credentials are mutually exclusive")
+        return ManagementClient(
+            credentials=_TokenFunctionCredentials(api_key),
+            base_url_override=base_url_override,
+        )
+    return ManagementClient(
+        api_key=api_key, credentials=credentials, base_url_override=base_url_override
+    )
 
 
 def _volume_or_point(ref: str | VolumeRef) -> VolumeRef:
