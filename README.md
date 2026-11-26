@@ -32,6 +32,21 @@ with VolumeClient(api_key="...") as volumes:
 print(result.version_ref, result.file_count, result.bytes_written)
 ```
 
+Without an API key, pass `credentials`, such as baseten-python's
+`WorkloadIdentityCredentials`, or pass `api_key` a function that returns a
+current Baseten token. Either is asked for a token on every mint, so a pull can
+outlast one short-lived token.
+
+```python
+from baseten.client import WorkloadIdentityCredentials
+
+credentials = WorkloadIdentityCredentials(
+    trust_rule_id="...", identity_token_file="/var/run/secrets/tokens/baseten"
+)
+with VolumeClient(credentials=credentials) as volumes:
+    volumes.pull("bdn:loops/sampler-abc123:step-100", "./checkpoint")
+```
+
 Refs are `bdn:<namespace>/<volume>` with an optional `:<tag>` or `@<digest>`
 selector and an optional `/path` inside the version; `VolumeRef` parses and
 renders them. A path on the ref, or `include=[...]`, narrows a pull to those
